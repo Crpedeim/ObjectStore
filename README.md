@@ -1,0 +1,321 @@
+# objstore
+
+A Dynamo-style distributed object store, written from scratch in Go.
+
+Keys are spread over a consistent-hashing ring and kept on N replicas, with tunable read and write
+quorums. Any node accepts any request. Concurrent writes are tracked with **dotted version vectors**,
+so they're kept side by side as siblings instead of one silently overwriting the other. Four
+separate mechanisms bring replicas back in step after failures. A chaos harness runs the real
+binaries through crashes and freezes, and checks afterwards that nothing it was promised was lost.
+
+**Measured results**
+
+- **0 of 12,790 acknowledged writes lost** across 41 injected node crashes and freezes, on real
+  processes. The checker plants a fabricated write in every run, which it must report lost, to prove
+  it can detect loss.
+- **Anti-entropy** brought acknowledged writes left under-replicated after failures from **437 to 0**,
+  and finds one differing key among 10,000 using **0.9%** of the bytes of a full key listing.
+- **A coordinator crash** failed **592** requests before replica fallback was added; with it, **1**.
+- **283 tests**, all run under Go's race detector. Each feature was also checked by deliberately
+  breaking it and confirming a test fails.
+
+---
+
+**Contents:** [Quick start](#quick-start) · [Architecture](#architecture) ·
+[Design decisions](#design-decisions-and-their-trade-offs) · [Testing](#testing) ·
+[Benchmarks](#benchmarks) · [HTTP API](#http-api) · [Configuration](#configuration) ·
+[Repository layout](#repository-layout) · [Limitations](#limitations-and-future-work) ·
+[References](#references)
+
+## Quick start
+
+Needs Go 1.22 or later and `curl`. `scripts/cluster.sh` runs on Linux (it reads `/proc`); the node
+itself builds anywhere.
+
+```bash
+git clone https://github.com/Crpedeim/objstore && cd objstore
+
+scripts/cluster.sh start --nodes 5 --n 3 --r 2 --w 2   # five nodes, plus a load balancer on :8080
+export PATH=$PWD/bin:$PATH
+
+echo "hello, world" | objctl put greeting
+objctl get greeting
+objctl members
+
+scripts/cluster.sh kill n3      # SIGKILL a node: reads and writes carry on
+objctl get greeting
+scripts/cluster.sh revive n3    # it comes back and is caught up
+scripts/cluster.sh stop
+```
+
+`cluster.sh start` saves N, R and W in `data/config`, and `add` and `revive` reuse them, so every
+node agrees. Run `scripts/cluster.sh` alone for all its commands and options.
+
+**Conflicts.** Two writes that start from the same version are concurrent, and both are kept:
+
+```console
+$ objctl get doc
+doc has 2 concurrent versions:
+  n2.1:2  (6 bytes)
+  n2.1:3  (4 bytes)
+read one:  objctl get -version VERSION doc
+resolve:   objctl put -context n2.1=3| doc FILE
+$ objctl get -version n2.1:2 doc
+alice
+$ echo alice+bob | objctl put -context 'n2.1=3|' doc
+stored doc: version n2.1:4, on 2 replicas
+context: n2.1=4|
+$ objctl get doc
+alice+bob
+```
+
+`objctl` exits 0 on success, 1 for not found, 2 for an error, 3 for a conflict, and 4 when too few
+replicas answered, so scripts can tell them apart.
+
+## Architecture
+
+![Cluster overview](docs/diagrams/cluster.png)
+
+Every node runs the same binary and accepts every request. The node a request reaches finds the
+key's replicas on the ring (the next N distinct nodes clockwise from the key's hash, with 256
+virtual points per node) and forwards it to the key's **coordinator**: the first of those replicas
+that gossip doesn't report as down. Sending every write for a key to one node means writes to a key
+normally meet in one place, which keeps siblings rare.
+
+Gossip takes a few seconds to notice a crash. Meanwhile, if forwarding fails in a way that proves
+the coordinator never received the request, the request goes to the next replica instead. A write
+that may have arrived is never sent to a second replica; reads, which change nothing, always may be.
+
+![Inside a node](docs/diagrams/node.png)
+
+Inside a node, requests flow across the top. The **router** picks the coordinator. The **API**
+coordinates reads and writes. The **store** holds one file per version. Membership comes from
+**gossip** (SWIM failure detection, through HashiCorp's memberlist), and every component reads it as
+an immutable snapshot of the ring and who is down. Three background loops repair replicas, and all
+three draw on one per-node bandwidth budget, so repair can't swamp live traffic.
+
+### Writes and reads
+
+![The write path](docs/diagrams/write-path.png)
+
+A write without a context is **blind**: the coordinator first reads R replicas to learn what it
+replaces, then creates a new version, stores it with fsync, and pushes it to the other replicas. It
+answers once **W** replicas hold it, its own copy included. A replica that couldn't be reached gets a
+**hint**, delivered later. A write carrying a context, from an earlier read, skips the quorum read
+and replaces exactly what that context names.
+
+A read gathers **R** replicas' versions and returns the newest, or every concurrent one as siblings
+(HTTP 300). Then, in the background, it sends any replica that answered with something older what
+it lacks.
+
+If R + W > N, every read quorum overlaps every write quorum, so while nodes agree on the ring, a read
+sees every acknowledged write. `cluster.sh` warns when you choose settings that don't satisfy that.
+
+### Concurrent writes: dotted version vectors
+
+![Concurrent writes become siblings](docs/diagrams/siblings.png)
+
+Every version carries a **dot**, a unique (node, counter) pair, and a **past**, the set of versions
+it replaces. A version is dropped only when another version's past contains its dot. Two writes
+from the same starting point therefore both survive, and a client resolves them by writing with the
+context it was given. Last-write-wins would have kept one and dropped the other without telling
+anyone. Dots stay unique across restarts because each node starts a new **epoch** every time it
+opens its store.
+
+### Staying converged
+
+![Four repair mechanisms](docs/diagrams/repair.png)
+
+Each repair mechanism has its own trigger, and anti-entropy catches whatever the other three miss.
+The chaos harness measured why it matters: with hints and anti-entropy both off, 437 acknowledged
+writes stayed on fewer than N replicas after healing; with anti-entropy on, none did.
+
+**Hints** are small markers, not copies of the data. The coordinator is always a replica, so it
+already holds the value. A dispatcher delivers each node's hints when gossip says it's back. Hints
+expire after 3 hours, and at most 100,000 are kept; past either limit, anti-entropy repairs instead.
+
+### Anti-entropy
+
+![Merkle-tree descent](docs/diagrams/merkle.png)
+
+Every 30 seconds, each node compares its replicas with each peer's, using a Merkle tree over the
+keys **both** replicate. A leaf hashes its bucket's keys and their version contexts, and two replicas
+hold the same versions of a key exactly when their contexts match. The exchange descends only into
+subtrees whose hashes differ, then repairs each differing key in both directions. The tree pays off
+when differences are rare. When many keys differ it costs more than a full listing, as
+[the benchmarks](docs/benchmarks/RESULTS.md) show.
+
+### Durability
+
+A version is written to a temporary file and fsynced, hard-linked into place, and its directory
+fsynced, all before any version it replaces is deleted. A crash at any point leaves the old
+versions, the new one, or both, never neither; when both survive, the new version's past says it
+replaces the old. Handoff deletes a node's copy of a key only once all N of
+the key's replicas hold everything it held.
+
+## Design decisions and their trade-offs
+
+| Decision | Why | What it costs |
+|---|---|---|
+| Leaderless replication (Dynamo), not Raft | Any replica can take writes; no election pauses | Concurrent writes must be resolved: siblings |
+| Dotted version vectors, not last-write-wins | No acknowledged write is ever silently dropped | Clients may have to merge siblings |
+| Coordinator = first live replica | Writes to a key meet at one node, so siblings are rare | A crash briefly redirects that key's traffic |
+| Fall back to the next replica only when a request provably never arrived | Survives the failure-detection window without double-applying writes | One failed write per in-flight request at the moment of a crash |
+| Strict quorums, not sloppy | Acknowledged means stored on W of the key's own replicas | With too many of a key's replicas down, writes answer 503 |
+| Hints as markers, not copies | The coordinator already holds the value | A hint is lost if its coordinator's disk is |
+| One file per version, fsynced | Simple and crash-safe | Several fsyncs and file operations per write |
+| HTTP and JSON between nodes | Every call can be inspected with `curl` | Per-request overhead on every hop |
+| Merkle trees rebuilt for each exchange | No tree state to keep consistent with writes | Each exchange walks the store |
+
+## Testing
+
+```bash
+go test -race ./...
+```
+
+**283 tests** in 17 packages, all run under the race detector. They cover single components (the
+store, version vectors, the ring), in-process clusters with network partitions simulated by
+switches, and whole nodes gossiping and crashing in one process.
+
+Each feature was also checked by **breaking it on purpose**: changing one line, such as skipping a
+fsync, pulling instead of pushing, or retrying a write that may have arrived, and confirming that a
+test fails. Where a break went undetected, a test was added or tightened.
+
+**The chaos harness** runs the real node binary as separate processes:
+
+```bash
+go build -o bin/node ./cmd/node && go build -o bin/chaos ./cmd/chaos
+bin/chaos -duration 60s
+```
+
+Clients write, delete and read through random nodes while a nemesis `kill -9`s or `SIGSTOP`s a node
+every few seconds. Afterwards the cluster heals, and the harness checks, using the dots the cluster
+returned:
+
+- **lost**: an acknowledged write that no node holds and nothing has replaced;
+- **invisible**: an acknowledged write that a quorum read doesn't reflect;
+- **stale reads**: a read that missed a write acknowledged before it began;
+- **under-replicated**: an acknowledged write missing from one of its key's replicas;
+- **duplicate dots**: two acknowledged writes sharing a dot.
+
+It also plants a fabricated acknowledgement, which must be reported lost; if it isn't, the run is
+invalid. Run against deliberately broken builds, it caught a coordinator that discarded its own copy
+(1,459 writes lost) and replicas that acknowledged without storing (every write under-replicated).
+It exits 1 if any check fails.
+
+## Benchmarks
+
+Full results, method and caveats: [docs/benchmarks/RESULTS.md](docs/benchmarks/RESULTS.md).
+
+> **Measured on a single shared CPU core**, with every node, the load balancer and the load generator
+> on one machine. The numbers show relative costs, not what a real cluster would do.
+
+| What | Result |
+|---|---|
+| One client, N=3, R=2, W=2 | read 1.4 ms, write 5.5 ms (p50) |
+| Each extra write acknowledgement (W) | about +0.8 ms (p50) |
+| The quorum read before a blind write | about 0.5 ms, ~7% of a write |
+| Value size | the same operation rate from 1 KiB to 64 KiB; 74 MB/s at 1 MiB |
+| One difference among 10,000 keys | 5 requests, 3,448 bytes, against 377,785 for a full listing |
+| A coordinator crash, 4 clients | 592 failed requests before replica fallback; 1 after |
+
+A CPU profile found no single hotspot. The disk path is the largest share, with fsync about 18% of a
+node's CPU, so batching fsyncs would be the first optimization. Run any case yourself with
+`scripts/bench.sh`, and summarise results with `bin/objbench -report`.
+
+## HTTP API
+
+| Request | Answers |
+|---|---|
+| `GET /objects/{key}` | 200 the value · 300 concurrent siblings (JSON list) · 404 none or deleted · 503 too few replicas |
+| `GET /objects/{key}?version=V` | 200 that sibling's value |
+| `PUT /objects/{key}` | 201 once W replicas have it · 503 fewer did: it may still be stored, and spread |
+| `PUT` with `If-None-Match: *` | 201, or 412 if a live value exists |
+| `DELETE /objects/{key}` | 204 once W replicas have the tombstone · 404 nothing to delete |
+| `GET /cluster/members` | every node, its address, and whether it's alive |
+| `GET /cluster/owner/{key}` | the key's replicas, in order |
+| `GET /healthz` | 200 |
+
+Headers: `X-Objstore-Context` on every response describing a key is everything the client has now
+seen. Send it back with a `PUT` or `DELETE` to replace exactly those versions; without it a write is
+blind. `X-Objstore-Version` is the dot of the version returned or written, and `X-Objstore-Acks`
+how many replicas stored a write. Keys may contain slashes, and values stream in both directions.
+
+Nodes talk to each other under `/internal/`: `/internal/versions/{key}` to list, push and fetch exact
+versions on that node's own disk, and `/internal/ae/` for anti-entropy. The `internal/client`
+package is a small Go client for the public API.
+
+## Configuration
+
+`bin/node` flags:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-id` | (required) | node identifier |
+| `-data` | (required) | data directory |
+| `-listen` | `127.0.0.1:8080` | HTTP address to listen on |
+| `-advertise` | `-listen` | HTTP address peers use to reach this node |
+| `-gossip` | `127.0.0.1:7946` | gossip address |
+| `-join` | | gossip addresses of existing members, comma-separated; empty founds a new cluster |
+| `-vnodes` | 256 | virtual nodes per physical node |
+| `-n`, `-r`, `-w` | 3, 2, 2 | replicas per key; replicas a read waits for; replicas a write waits for |
+| `-transfer-mb` | 50 | background transfer budget (handoff, hints, anti-entropy) in MB/s; 0 is unlimited |
+| `-anti-entropy` | 30s | how often to compare replicas with each peer; 0 turns it off |
+| `-hint-window` | 3h | how long a hint is kept before anti-entropy is left to repair |
+| `-max-hints` | 100000 | the most hints kept at once; below zero is no limit |
+| `-handoff-interval` | 30s | how often handoff sweeps between membership changes |
+| `-hints` | true | record hints for missed replicas; false only for experiments |
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `cmd/node` | the node binary |
+| `cmd/objctl` | command-line client, and `objctl lb`, the load balancer |
+| `cmd/chaos` | the chaos harness |
+| `cmd/objbench` | the load generator and report tool |
+| `cmd/ringstat` | measures how evenly the ring spreads keys, and how many move when it changes |
+| `internal/store` | one file per version; crash-safe writes; epochs |
+| `internal/version` | dotted version vectors: dots, contexts, resolving siblings |
+| `internal/ring` | consistent hashing with virtual nodes; preference lists |
+| `internal/cluster` | immutable membership views, and their holder |
+| `internal/gossip` | SWIM membership through memberlist; remembers every member |
+| `internal/router` | routing to the coordinator, fallback to the next replica |
+| `internal/api` | the coordinator: quorums, siblings, read repair, hints |
+| `internal/replica` | the node-to-node client |
+| `internal/handoff` | handoff after ring changes, the hint store and dispatcher |
+| `internal/antientropy` | Merkle-tree replica synchronization |
+| `internal/throttle` | the shared bandwidth budget |
+| `internal/stall` | abandons transfers that stop moving bytes |
+| `internal/fsutil` | atomic file writes and directory fsync |
+| `internal/node` | wires a node together |
+| `internal/lb`, `internal/client` | the load balancer and the Go client |
+| `internal/chaos`, `internal/bench` | the chaos harness and the load generator |
+| `scripts/cluster.sh`, `scripts/bench.sh` | run a local cluster; run benchmark cases |
+| `docs/` | diagrams and benchmark results |
+
+## Limitations and future work
+
+- **No sloppy quorums.** With too many of a key's replicas down, writes answer 503 rather than
+  borrowing another node. Sloppy quorums would trade that for weaker guarantees.
+- **No group commit.** Every write pays its own fsyncs; batching them is the clearest performance win.
+- **No decommissioning.** A node that leaves for good stays in the ring; there's no command to
+  remove it and rebalance.
+- **Anti-entropy trees are rebuilt each exchange**, and cost more than a full listing when many keys
+  differ. Incrementally maintained trees, and streaming whole ranges when much differs, would fix both.
+- **HTTP and JSON between nodes**, and clients that don't know the ring, add a hop and per-request
+  overhead. A binary protocol and ring-aware clients would remove them.
+- **No authentication or TLS.** Run it only on a trusted network.
+- **Tested on one machine.** The chaos harness uses real processes, but no real network
+  partitions. Jepsen would be the next step.
+
+## References
+
+- DeCandia et al., *Dynamo: Amazon's Highly Available Key-value Store*, SOSP 2007.
+- Almeida et al., *Scalable and Accurate Causality Tracking for Eventually Consistent Stores*
+  (dotted version vectors), DAIS 2014.
+- Das, Gupta and Motivala, *SWIM: Scalable Weakly-consistent Infection-style Process Group
+  Membership Protocol*, DSN 2002.
+- Dadgar, Phillips and Currey, *Lifeguard: Local Health Awareness for More Accurate Failure
+  Detection*, 2018.
+- Martin Kleppmann, *Designing Data-Intensive Applications*, chapters 5 and 6.
