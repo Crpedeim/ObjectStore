@@ -56,7 +56,11 @@ type Config struct {
 	// limit. Past either, anti-entropy repairs what hints would have.
 	HintWindow time.Duration
 	MaxHints   int
-	Log        *slog.Logger
+	// Sloppy turns on sloppy quorums: when a key's replicas can't be reached,
+	// the next nodes past them on the ring stand in, and hand their copies
+	// back once the replicas return.
+	Sloppy bool
+	Log    *slog.Logger
 
 	// HandoffInterval is how often handoff sweeps between membership
 	// changes; zero means handoff.DefaultInterval.
@@ -149,10 +153,11 @@ func Start(cfg Config) (*Node, error) {
 		View: g.Holder(),
 		Local: api.Handler(api.Config{
 			Store: st, NodeID: cfg.ID, Log: cfg.Log,
-			View: g.Holder(), N: cfg.N, R: cfg.R, W: cfg.W, Peers: peers, Hints: hinter,
+			View: g.Holder(), N: cfg.N, R: cfg.R, W: cfg.W, Peers: peers, Hints: hinter, Sloppy: cfg.Sloppy,
 		}),
 		Client: httpClient,
 		N:      cfg.N,
+		Sloppy: cfg.Sloppy,
 		Log:    cfg.Log,
 	}))
 
@@ -189,7 +194,7 @@ func Start(cfg Config) (*Node, error) {
 		}
 		go func() { loops.Wait(); close(n.stopped) }()
 	}
-	cfg.Log.Info("node started", "http", adv, "gossip", g.Addr(), "join", cfg.Join, "n", cfg.N, "r", cfg.R, "w", cfg.W)
+	cfg.Log.Info("node started", "http", adv, "gossip", g.Addr(), "join", cfg.Join, "n", cfg.N, "r", cfg.R, "w", cfg.W, "sloppy", cfg.Sloppy)
 	return n, nil
 }
 

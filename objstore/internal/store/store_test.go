@@ -939,3 +939,40 @@ func TestStoreMatchesModel(t *testing.T) {
 		t.Fatalf("the run never exercised everything: %v", ops)
 	}
 }
+
+// Siblings takes no lock, so a write can replace a key's only version while
+// a reader is listing it: the reader's directory listing names the old
+// file, which is gone by the time the reader opens it, and the new one isn't
+// in the listing at all. The reader must never see an empty key for that: a
+// key that always holds a value always reads as holding one.
+func TestSiblingsNeverMissesAKeyBeingOverwritten(t *testing.T) {
+	s := newStore(t)
+	put(t, s, "k", "v0")
+	const writes = 300
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 1; i <= writes; i++ {
+			if _, _, err := s.Write("k", coordinate("t", nil, false), strings.NewReader(fmt.Sprintf("v%d", i))); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	for reads := 0; ; reads++ {
+		select {
+		case <-done:
+			t.Logf("%d reads during %d overwrites", reads, writes)
+			return
+		default:
+		}
+		sibs, err := s.Siblings("k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(sibs) == 0 {
+			<-done
+			t.Fatalf("read %d of a key being overwritten found no version at all", reads)
+		}
+	}
+}

@@ -155,3 +155,64 @@ per run to +1. The throughput effect on this machine is small:
 
 The fixed code won all three alternated pairs (+11%, +7%, +3%), but the ranges overlap. Connection
 setup is cheap over loopback; the fixes matter more on a real network, and for port exhaustion.
+
+### 8. Two of five nodes down: strict quorums fail ~30% of requests, sloppy ones none
+
+Measured later than findings 1–7, on a 4-core machine, so compare the two columns with each other,
+not with the tables above. Four clients through the balancer, N=3 R=2 W=2; n2 and n4 killed about
+3 s into the measurement and revived about 10 s later, once with strict quorums and once with
+`--sloppy`.
+
+| second | strict: succeeded | strict: failed | sloppy: succeeded | sloppy: failed |
+|---|---|---|---|---|
+| 1 | 746 | 0 | 769 | 0 |
+| 2 | 838 | 0 | 802 | 0 |
+| 3 | 857 | 30 | 820 | 0 |
+| 4 | 742 | 361 | 679 | 4 |
+| 5 | 785 | 314 | 683 | 0 |
+| 6 | 720 | 333 | 703 | 0 |
+| 7 | 807 | 368 | 637 | 0 |
+| 8 | 787 | 361 | 691 | 0 |
+| 9 | 685 | 297 | 685 | 0 |
+| 10 | 784 | 326 | 688 | 0 |
+| 11 | 762 | 322 | 600 | 0 |
+| 12 | 630 | 265 | 709 | 0 |
+| 13 | 774 | 334 | 671 | 0 |
+| 14 | 677 | 0 | 412 | 0 |
+| 15 | 849 | 0 | 442 | 0 |
+| 16 | 888 | 0 | 561 | 0 |
+| 17 | 798 | 0 | 698 | 0 |
+| 18 | 878 | 0 | 718 | 0 |
+| 19 | 816 | 0 | 786 | 0 |
+| 20 | 894 | 0 | 789 | 0 |
+| 21 | 878 | 0 | 735 | 0 |
+| 22 | 864 | 0 | 735 | 0 |
+| 23 | 774 | 0 | 749 | 0 |
+| 24 | 833 | 0 | 717 | 0 |
+| 25 | 849 | 0 | 791 | 0 |
+
+**Strict:** 3,308 requests answered 503 and 3 failed, all during the outage: about 30% of
+traffic, roughly the share of keys with two of their three replicas on n2 and n4. Every one of those
+keys still had a live replica, and the cluster three live nodes.
+
+**Sloppy:** 4 failed, the requests in flight at the instant of the kill, which no quorum setting can
+save; none was refused for want of replicas. The price shows twice. During the outage successful
+throughput is about 10% lower: a write whose replicas are down also pushes to stand-ins. And it dips
+for a few seconds after the revival, while the stand-ins hand their copies back. Reads found 4
+conflicts: blind writes coordinated by a stand-in and by a replica are concurrent, so they become
+siblings, and a later read returns both.
+
+Reproduce it with two terminals: `scripts/cluster.sh start [--sloppy]` and
+`bin/objbench -clients 4 -duration 25s -timeline` in one, `scripts/cluster.sh kill n2; scripts/cluster.sh kill n4`
+then `revive` in the other.
+
+### Reproducing the anti-entropy figure
+
+The README's "one difference among 10,000 keys" row comes from the anti-entropy test, sized up:
+
+```bash
+go test -run OneDifference -v ./internal/antientropy -args -shared-keys 10000
+# 10000 shared keys, 1 different: 5 requests, 3411 bytes exchanged, against 377785 for a full listing (0.90%)
+```
+
+It runs on 2,000 keys by default, where the same 5 requests cost 4.5% of a smaller listing.

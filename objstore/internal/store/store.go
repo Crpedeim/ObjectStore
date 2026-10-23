@@ -101,7 +101,11 @@ type Store struct {
 	// locks serialises Write and Remove per key. 64 stripes: unrelated keys
 	// rarely wait on each other, and memory stays fixed however many keys
 	// there are.
-	locks [64]sync.Mutex
+	locks [stripes]sync.Mutex
+	// changes counts, per stripe, the changes to a key's directory: odd
+	// while one is under way. A reader that takes no lock trusts its
+	// listing only if the count was even and the same before and after.
+	changes [stripes]atomic.Uint64
 
 	epochMu sync.Mutex
 	epoch   atomic.Uint64
@@ -254,10 +258,23 @@ func (s *Store) versionPath(key string, d version.Dot) string {
 	return filepath.Join(s.keyDir(key), nameFor(d.String()))
 }
 
-func (s *Store) lockFor(key string) *sync.Mutex {
+// stripes is how many locks, and change counts, keys share.
+const stripes = 64
+
+func stripe(key string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(key))
-	return &s.locks[h.Sum32()%uint32(len(s.locks))]
+	return h.Sum32() % stripes
+}
+
+func (s *Store) lockFor(key string) *sync.Mutex { return &s.locks[stripe(key)] }
+
+// changing marks key's directory as changing, until the function it returns
+// is called. Call it holding the key's lock.
+func (s *Store) changing(key string) (done func()) {
+	c := &s.changes[stripe(key)]
+	c.Add(1)
+	return func() { c.Add(1) }
 }
 
 func appendString(b []byte, s string) []byte {
@@ -414,13 +431,34 @@ func resolve(ms []Meta) []Meta {
 // stored version that no other stored version replaces, ordered by dot. A
 // key with nothing stored returns none and no error.
 //
-// It takes no lock. A Write publishes a complete file before removing what
-// it replaces, so a reader that catches the moment in between sees both,
-// and resolving drops the replaced one.
+// It usually takes no lock, and a reader that lists the key's directory
+// while a Write replaces a version can't trust what it sees: it may list the
+// directory before the new file is linked and open the old one after it is
+// removed, or a directory changing under it may list neither. Either way
+// the key would read as empty. So a listing is kept only if no change to the
+// key began or ended while it was taken; otherwise it is taken again. A key
+// rewritten so fast that it never holds still is read under its lock.
 func (s *Store) Siblings(key string) ([]Meta, error) {
 	if key == "" {
 		return nil, ErrEmptyKey
 	}
+	c := &s.changes[stripe(key)]
+	for attempt := 0; attempt < 3; attempt++ {
+		before := c.Load()
+		if before%2 == 1 {
+			continue // a change is under way
+		}
+		all, err := s.readAll(key)
+		if err != nil {
+			return nil, err
+		}
+		if c.Load() == before {
+			return resolve(all), nil
+		}
+	}
+	mu := s.lockFor(key)
+	mu.Lock()
+	defer mu.Unlock()
 	all, err := s.readAll(key)
 	if err != nil {
 		return nil, err
@@ -428,9 +466,6 @@ func (s *Store) Siblings(key string) ([]Meta, error) {
 	return resolve(all), nil
 }
 
-// Open returns a reader for the value of one version of key, and its Meta.
-// The caller must Close the reader. A version replaced since it was listed
-// returns ErrNotFound.
 func (s *Store) Open(key string, d version.Dot) (io.ReadCloser, Meta, error) {
 	if key == "" {
 		return nil, Meta{}, ErrEmptyKey
@@ -546,6 +581,8 @@ func (s *Store) Write(key string, plan Plan, r io.Reader) (m Meta, stored bool, 
 			return Meta{}, false, err
 		}
 	}
+	// From the link to the last removal, the key's directory is changing.
+	defer s.changing(key)()
 	// link publishes the complete file under its final name. Each version
 	// has a distinct name, so link — which never overwrites — is enough.
 	if err = os.Link(tmpName, s.versionPath(key, m.Version.Dot)); err != nil {
@@ -590,6 +627,7 @@ func (s *Store) Remove(key string, dots []version.Dot) error {
 	mu := s.lockFor(key)
 	mu.Lock()
 	defer mu.Unlock()
+	defer s.changing(key)()
 	dir := s.keyDir(key)
 	for _, d := range dots {
 		if err := os.Remove(s.versionPath(key, d)); err != nil && !errors.Is(err, fs.ErrNotExist) {

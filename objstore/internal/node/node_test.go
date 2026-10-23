@@ -1235,3 +1235,74 @@ func staleOn(t *testing.T, back, observer *testNode, keys []string, id string) (
 	}
 	return stale, total
 }
+
+func sloppy(c *Config) { c.Sloppy = true }
+
+// TestTwoReplicasDownLosesQuorum with sloppy quorums: two of a key's three
+// replicas down, and every read and write of it still succeeds, the writes
+// landing on stand-ins. When the replicas come back, the stand-ins hand
+// their copies over and drop them: every key ends on exactly its three
+// replicas, at its latest value.
+func TestSloppyQuorumSurvivesTwoReplicasDown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in -short")
+	}
+	nodes := startReplicatedWith(t, 5, 3, 2, 2, sloppy)
+	keys := writeKeys(t, nodes, 200)
+	waitForCopies(t, nodes, keys, 3)
+	dead := []*testNode{nodes[1], nodes[2]}
+	for _, d := range dead {
+		d.Crash()
+	}
+	alive := []*testNode{nodes[0], nodes[3], nodes[4]}
+	for _, nd := range alive {
+		nd := nd
+		waitFor(t, "both marked down", func() bool { return nd.View().Down(dead[0].id) && nd.View().Down(dead[1].id) })
+	}
+
+	twoDown := 0
+	for i, k := range keys {
+		reps := alive[0].View().PreferenceList(k, 3)
+		if slices.Contains(reps, dead[0].id) && slices.Contains(reps, dead[1].id) {
+			twoDown++
+		}
+		entry := alive[i%len(alive)]
+		if code, body, _ := get(t, entry.url(k)); code != http.StatusOK || body != "value-"+k {
+			t.Fatalf("read %s with two nodes down: %d %q", k, code, body)
+		}
+		if code := send(t, http.MethodPut, entry.url(k), "updated-"+k); code != http.StatusCreated {
+			t.Fatalf("write %s with two nodes down: %d", k, code)
+		}
+	}
+	standingIn := 0
+	for _, k := range keys {
+		reps := alive[0].View().PreferenceList(k, 3)
+		for _, id := range holders(t, alive, k) {
+			if !slices.Contains(reps, id) {
+				standingIn++
+				break
+			}
+		}
+	}
+	t.Logf("two nodes down: all %d keys read and written, %d with two replicas down; %d held by a stand-in",
+		len(keys), twoDown, standingIn)
+	if twoDown == 0 || standingIn == 0 {
+		t.Fatal("no key lost two replicas, or none went to a stand-in: the test proves nothing")
+	}
+
+	for i, d := range dead {
+		nodes[1+i] = startNRWWith(t, d.id, d.dir, d.gossip, 3, 2, 2, sloppy, nodes[0].gossip)
+	}
+	for _, nd := range nodes {
+		nd := nd
+		waitFor(t, "both back up", func() bool { return !nd.View().Down(dead[0].id) && !nd.View().Down(dead[1].id) })
+	}
+	start := time.Now()
+	waitForCopies(t, nodes, keys, 3)
+	t.Logf("stand-ins handed every key back %v after the replicas returned", time.Since(start).Round(time.Millisecond))
+	for i, k := range keys {
+		if code, body, _ := get(t, nodes[i%len(nodes)].url(k)); code != http.StatusOK || body != "updated-"+k {
+			t.Fatalf("after healing, %s: %d %q", k, code, body)
+		}
+	}
+}

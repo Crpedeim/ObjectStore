@@ -38,7 +38,6 @@ func TestListReusesItsConnection(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte("[]\n"))
 	}))
-	t.Logf("handler path check: %s", addr)
 	c := &Client{HTTP: &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 4}, Timeout: 5 * time.Second}}
 	for i := 0; i < 20; i++ {
 		if _, err := c.List(context.Background(), addr, "k"); err != nil {

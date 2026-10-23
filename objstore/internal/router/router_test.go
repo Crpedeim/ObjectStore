@@ -1147,3 +1147,55 @@ func TestEveryReplicaUnreachable(t *testing.T) {
 		}
 	}
 }
+
+// ---- sloppy quorums ----
+
+// With every replica of a key marked down, a strict router answers 503 (see
+// TestCoordinatorIsFirstLiveReplica). A sloppy one sends the request to the
+// first node past the replicas, in the key's preference order, that gossip
+// doesn't say is down — and the owner endpoint names that node.
+func TestSloppyRouterPassesEveryDownReplica(t *testing.T) {
+	ids := []string{"n1", "n2", "n3", "n4", "n5", "n6"}
+	dummy := map[string]string{}
+	for _, id := range ids {
+		dummy[id] = "unused"
+	}
+	key := "k"
+	ref, _ := cluster.NewView(ids[0], dummy, testVnodes)
+	all := ref.PreferenceList(key, len(ids))
+	reps, spares := all[:3], all[3:]
+	// The first stand-in is down too, so the second must coordinate.
+	down := append(slices.Clone(reps), spares[0])
+	views := func(t *testing.T, id string, addrs map[string]string) *cluster.View {
+		var others []string // a node never sees itself as down
+		for _, d := range down {
+			if d != id {
+				others = append(others, d)
+			}
+		}
+		v, err := cluster.NewView(id, addrs, testVnodes, others...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	c := startNodesWith(t, ids, views, Config{N: 3, Sloppy: true})
+	// The entry is the last stand-in, so the request has to be forwarded.
+	// (A node never sees itself as down, so any node in down would serve
+	// the request itself.)
+	entry := c.nodes[spares[2]]
+	resp := do(t, http.MethodPut, objURL(entry, key), strings.NewReader("v"))
+	mustStatus(t, resp, http.StatusCreated)
+	if got := resp.Header.Get(NodeHeader); got != spares[1] {
+		t.Fatalf("coordinated by %s, want %s: the first stand-in not marked down", got, spares[1])
+	}
+	r := do(t, http.MethodGet, entry.url+"/cluster/owner/"+key, nil)
+	defer r.Body.Close()
+	var or ownerResponse
+	if err := json.NewDecoder(r.Body).Decode(&or); err != nil {
+		t.Fatal(err)
+	}
+	if or.Coordinator != spares[1] || !slices.Equal(or.PreferenceList, reps) {
+		t.Fatalf("owner endpoint: coordinator %q, replicas %v; want %s and %v", or.Coordinator, or.PreferenceList, spares[1], reps)
+	}
+}

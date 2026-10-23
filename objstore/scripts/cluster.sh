@@ -18,8 +18,10 @@
 #   --w W             replicas a write waits for          (WRITES, default 2)
 #   --transfer-mb MB  background transfer cap per node    (TRANSFER_MB, default 50; 0 = unlimited)
 #   --anti-entropy D  how often replicas compare          (ANTI_ENTROPY, default 30s; 0 = off)
+#   --sloppy          sloppy quorums: when a key's replicas are down, the
+#                     next nodes on the ring stand in     (SLOPPY=true; default off)
 # They're saved in data/config, and add and revive reuse them, so every node
-# in the cluster agrees on N, R and W.
+# in the cluster agrees on N, R, W and sloppiness.
 #
 # Then talk to it with bin/objctl, e.g.  echo hi | bin/objctl put greeting
 # Data and logs live in data/<id>/ and data/<id>.log; the balancer's in data/lb.log.
@@ -58,7 +60,7 @@ start_node() { # id [join]
 	local args=(-id "$id" -data "$DATA/$id"
 		-listen "127.0.0.1:$(http_port "$id")" -gossip "127.0.0.1:$(gossip_port "$id")"
 		-n "${REPLICAS:-3}" -r "${READS:-2}" -w "${WRITES:-2}" -transfer-mb "${TRANSFER_MB:-50}"
-		-anti-entropy "${ANTI_ENTROPY:-30s}")
+		-anti-entropy "${ANTI_ENTROPY:-30s}" -sloppy="${SLOPPY:-false}")
 	[[ -n "$join" ]] && args+=(-join "$join")
 	"$BIN" "${args[@]}" >>"$DATA/$id.log" 2>&1 &
 	echo $! >"$DATA/$id.pid"
@@ -160,9 +162,10 @@ start)
 	shift
 	n=5
 	REPLICAS=${REPLICAS:-3} READS=${READS:-2} WRITES=${WRITES:-2}
-	TRANSFER_MB=${TRANSFER_MB:-50} ANTI_ENTROPY=${ANTI_ENTROPY:-30s}
+	TRANSFER_MB=${TRANSFER_MB:-50} ANTI_ENTROPY=${ANTI_ENTROPY:-30s} SLOPPY=${SLOPPY:-false}
 	while [[ $# -gt 0 ]]; do
 		if [[ $1 =~ ^[0-9]+$ ]]; then n=$1; shift; continue; fi
+		if [[ $1 == --sloppy ]]; then SLOPPY=true; shift; continue; fi
 		[[ $# -ge 2 ]] || die "$1 needs a value"
 		case $1 in
 		--nodes) n=$2 ;;
@@ -180,6 +183,7 @@ start)
 	done
 	((READS <= REPLICAS && WRITES <= REPLICAS)) || die "R ($READS) and W ($WRITES) can't exceed N ($REPLICAS)"
 	((n >= REPLICAS)) || die "$n nodes can't hold $REPLICAS replicas of each key"
+	[[ $SLOPPY == true || $SLOPPY == false ]] || die "SLOPPY must be true or false; got $SLOPPY"
 	((READS + WRITES > REPLICAS)) || echo "note: R + W <= N, so a read may miss an acknowledged write" >&2
 	if [[ -f "$DATA/nodes" ]]; then
 		for id in $(ids); do
@@ -190,10 +194,12 @@ start)
 	mkdir -p bin "$DATA"
 	go build -o "$BIN" ./cmd/node
 	go build -o bin/objctl ./cmd/objctl
-	printf 'REPLICAS=%s\nREADS=%s\nWRITES=%s\nTRANSFER_MB=%s\nANTI_ENTROPY=%s\n' \
-		"$REPLICAS" "$READS" "$WRITES" "$TRANSFER_MB" "$ANTI_ENTROPY" >"$DATA/config"
+	printf 'REPLICAS=%s\nREADS=%s\nWRITES=%s\nTRANSFER_MB=%s\nANTI_ENTROPY=%s\nSLOPPY=%s\n' \
+		"$REPLICAS" "$READS" "$WRITES" "$TRANSFER_MB" "$ANTI_ENTROPY" "$SLOPPY" >"$DATA/config"
 	seq -f 'n%g' 1 "$n" >"$DATA/nodes"
-	echo "starting $n nodes: N=$REPLICAS R=$READS W=$WRITES"
+	sloppiness=""
+	[[ $SLOPPY == true ]] && sloppiness=", sloppy quorums"
+	echo "starting $n nodes: N=$REPLICAS R=$READS W=$WRITES$sloppiness"
 	# n1 founds the cluster; everyone else joins through it.
 	start_node n1
 	wait_healthy n1

@@ -3,7 +3,7 @@
 A Dynamo-style distributed object store, written from scratch in Go.
 
 Keys are spread over a consistent-hashing ring and kept on N replicas, with tunable read and write
-quorums. Any node accepts any request. Concurrent writes are tracked with **dotted version vectors**,
+quorums, strict or sloppy. Any node accepts any request. Concurrent writes are tracked with **dotted version vectors**,
 so they're kept side by side as siblings instead of one silently overwriting the other. Four
 separate mechanisms bring replicas back in step after failures. A chaos harness runs the real
 binaries through crashes and freezes, and checks afterwards that nothing it was promised was lost.
@@ -16,7 +16,9 @@ binaries through crashes and freezes, and checks afterwards that nothing it was 
 - **Anti-entropy** brought acknowledged writes left under-replicated after failures from **437 to 0**,
   and finds one differing key among 10,000 using **0.9%** of the bytes of a full key listing.
 - **A coordinator crash** failed **592** requests before replica fallback was added; with it, **1**.
-- **283 tests**, all run under Go's race detector. Each feature was also checked by deliberately
+- **Sloppy quorums**: with two of five nodes killed, strict quorums answered **3,308** requests 503;
+  sloppy quorums answered **0**, and every stand-in copy went back to its replicas once they returned.
+- **294 tests**, all run under Go's race detector. Each feature was also checked by deliberately
   breaking it and confirming a test fails.
 
 ---
@@ -33,7 +35,7 @@ Needs Go 1.22 or later and `curl`. `scripts/cluster.sh` runs on Linux (it reads 
 itself builds anywhere.
 
 ```bash
-git clone https://github.com/Crpedeim/objstore && cd objstore
+git clone https://github.com/Crpedeim/ObjectStore && cd ObjectStore/objstore
 
 scripts/cluster.sh start --nodes 5 --n 3 --r 2 --w 2   # five nodes, plus a load balancer on :8080
 export PATH=$PWD/bin:$PATH
@@ -49,7 +51,8 @@ scripts/cluster.sh stop
 ```
 
 `cluster.sh start` saves N, R and W in `data/config`, and `add` and `revive` reuse them, so every
-node agrees. Run `scripts/cluster.sh` alone for all its commands and options.
+node agrees. Add `--sloppy` to turn on [sloppy quorums](#sloppy-quorums). Run `scripts/cluster.sh`
+alone for all its commands and options.
 
 **Conflicts.** Two writes that start from the same version are concurrent, and both are kept:
 
@@ -111,6 +114,34 @@ it lacks.
 If R + W > N, every read quorum overlaps every write quorum, so while nodes agree on the ring, a read
 sees every acknowledged write. `cluster.sh` warns when you choose settings that don't satisfy that.
 
+### Sloppy quorums
+
+By default quorums are strict: only a key's own N replicas count, so with two of three down, its
+reads and writes answer 503. Start nodes with `-sloppy` (`cluster.sh start --sloppy`) and a replica
+that can't be reached is replaced by a **stand-in**: the next node clockwise past the key's N
+replicas that gossip doesn't say is down, as in Dynamo. The stand-in's copy counts toward W and its
+answer toward R. A replica gossip already calls down gets a stand-in at once, without waiting for a
+frozen node's timeout, and is still pushed to in case gossip is wrong. With every replica down, the
+router sends the request to a stand-in, which coordinates it.
+
+Handing the copies back needs no new mechanism: a stand-in holds the key outside its replica set,
+so handoff delivers it to all N replicas when they return, and deletes the stand-in's copy only
+once all N have it. Read repair never gives a stand-in a copy.
+
+The trade: writes stay available while most of a key's replicas are down, but R + W > N no longer
+guarantees a read sees every acknowledged write, until the stand-ins have handed their copies back;
+and blind writes through two coordinators, a replica and a stand-in, become siblings. Nothing
+acknowledged is lost either way: the chaos harness checks sloppy runs the same as strict ones.
+
+```console
+$ scripts/cluster.sh start --sloppy
+$ scripts/cluster.sh kill n2; scripts/cluster.sh kill n4   # two of greeting's replicas
+$ echo still writable | objctl put greeting
+stored greeting: version n3.1:2, on 2 replicas
+$ scripts/cluster.sh revive n2; scripts/cluster.sh revive n4
+# n1 and n5 stood in; a second later they have handed greeting back and dropped it
+```
+
 ### Concurrent writes: dotted version vectors
 
 ![Concurrent writes become siblings](docs/diagrams/siblings.png)
@@ -161,7 +192,8 @@ the key's replicas hold everything it held.
 | Dotted version vectors, not last-write-wins | No acknowledged write is ever silently dropped | Clients may have to merge siblings |
 | Coordinator = first live replica | Writes to a key meet at one node, so siblings are rare | A crash briefly redirects that key's traffic |
 | Fall back to the next replica only when a request provably never arrived | Survives the failure-detection window without double-applying writes | One failed write per in-flight request at the moment of a crash |
-| Strict quorums, not sloppy | Acknowledged means stored on W of the key's own replicas | With too many of a key's replicas down, writes answer 503 |
+| Strict quorums by default, sloppy on request | Strict: acknowledged means stored on W of the key's own replicas | Strict: with too many replicas down, writes answer 503. Sloppy: they succeed, but a read may miss them until stand-ins hand back |
+| Stand-ins hand back through handoff, not a new hint type | Handoff already moves keys a node shouldn't hold, and deletes only once all N have them | A stand-in's copy waits for every replica, not just the one it replaced |
 | Hints as markers, not copies | The coordinator already holds the value | A hint is lost if its coordinator's disk is |
 | One file per version, fsynced | Simple and crash-safe | Several fsyncs and file operations per write |
 | HTTP and JSON between nodes | Every call can be inspected with `curl` | Per-request overhead on every hop |
@@ -173,7 +205,7 @@ the key's replicas hold everything it held.
 go test -race ./...
 ```
 
-**283 tests** in 17 packages, all run under the race detector. They cover single components (the
+**294 tests** in 17 packages, all run under the race detector. They cover single components (the
 store, version vectors, the ring), in-process clusters with network partitions simulated by
 switches, and whole nodes gossiping and crashing in one process.
 
@@ -186,6 +218,7 @@ test fails. Where a break went undetected, a test was added or tightened.
 ```bash
 go build -o bin/node ./cmd/node && go build -o bin/chaos ./cmd/chaos
 bin/chaos -duration 60s
+bin/chaos -duration 60s -sloppy   # the same, with sloppy quorums
 ```
 
 Clients write, delete and read through random nodes while a nemesis `kill -9`s or `SIGSTOP`s a node
@@ -201,7 +234,13 @@ returned:
 It also plants a fabricated acknowledgement, which must be reported lost; if it isn't, the run is
 invalid. Run against deliberately broken builds, it caught a coordinator that discarded its own copy
 (1,459 writes lost) and replicas that acknowledged without storing (every write under-replicated).
-It exits 1 if any check fails.
+It exits 1 if any check fails. With `-sloppy` it also reports how many keys a stand-in still holds
+after healing, which should be none.
+
+**Bugs the tests found later.** Stress-running the suite showed a read could find no version of a key
+that was being overwritten: the store reads without a lock, and a directory listing taken during a
+write can name neither the old version nor the new one. Reads now check a per-key change counter and
+list again if a write overlapped them; a test that failed 80 runs in 80 under load now passes all.
 
 ## Benchmarks
 
@@ -218,6 +257,7 @@ Full results, method and caveats: [docs/benchmarks/RESULTS.md](docs/benchmarks/R
 | Value size | the same operation rate from 1 KiB to 64 KiB; 74 MB/s at 1 MiB |
 | One difference among 10,000 keys | 5 requests, 3,448 bytes, against 377,785 for a full listing |
 | A coordinator crash, 4 clients | 592 failed requests before replica fallback; 1 after |
+| Two of five nodes down for 10 s, 4 clients | 3,308 requests answered 503 with strict quorums; 0 with sloppy |
 
 A CPU profile found no single hotspot. The disk path is the largest share, with fsync about 18% of a
 node's CPU, so batching fsyncs would be the first optimization. Run any case yourself with
@@ -229,11 +269,11 @@ node's CPU, so batching fsyncs would be the first optimization. Run any case you
 |---|---|
 | `GET /objects/{key}` | 200 the value · 300 concurrent siblings (JSON list) · 404 none or deleted · 503 too few replicas |
 | `GET /objects/{key}?version=V` | 200 that sibling's value |
-| `PUT /objects/{key}` | 201 once W replicas have it · 503 fewer did: it may still be stored, and spread |
+| `PUT /objects/{key}` | 201 once W replicas (or, sloppy, stand-ins) have it · 503 fewer did: it may still be stored, and spread |
 | `PUT` with `If-None-Match: *` | 201, or 412 if a live value exists |
 | `DELETE /objects/{key}` | 204 once W replicas have the tombstone · 404 nothing to delete |
 | `GET /cluster/members` | every node, its address, and whether it's alive |
-| `GET /cluster/owner/{key}` | the key's replicas, in order |
+| `GET /cluster/owner/{key}` | the key's replicas, in order, and its coordinator now: with `-sloppy`, a stand-in when every replica is down |
 | `GET /healthz` | 200 |
 
 Headers: `X-Objstore-Context` on every response describing a key is everything the client has now
@@ -265,6 +305,7 @@ package is a small Go client for the public API.
 | `-max-hints` | 100000 | the most hints kept at once; below zero is no limit |
 | `-handoff-interval` | 30s | how often handoff sweeps between membership changes |
 | `-hints` | true | record hints for missed replicas; false only for experiments |
+| `-sloppy` | false | sloppy quorums: nodes past a key's replicas stand in for unreachable ones |
 
 ## Repository layout
 
@@ -296,8 +337,9 @@ package is a small Go client for the public API.
 
 ## Limitations and future work
 
-- **No sloppy quorums.** With too many of a key's replicas down, writes answer 503 rather than
-  borrowing another node. Sloppy quorums would trade that for weaker guarantees.
+- **Sloppy reads can be stale.** With `-sloppy`, a read during an outage may miss a write that only
+  stand-ins hold, until they hand it back. Riak-style per-request choice of strict or sloppy would
+  let each client pick.
 - **No group commit.** Every write pays its own fsyncs; batching them is the clearest performance win.
 - **No decommissioning.** A node that leaves for good stays in the ring; there's no command to
   remove it and rebalance.

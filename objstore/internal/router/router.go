@@ -53,6 +53,10 @@ type Config struct {
 	// them that gossip doesn't say is down: the key's coordinator. Zero
 	// means 1 — the owner alone, as before replication.
 	N int
+	// Sloppy lets a node past the key's N replicas coordinate when none of
+	// them can: the first one gossip doesn't say is down. Its API must be
+	// sloppy too, so that it counts its own copy as a stand-in's.
+	Sloppy bool
 }
 
 // DefaultStall is how long a forward may go without moving a byte.
@@ -135,13 +139,17 @@ func (rt *router) route(w http.ResponseWriter, r *http.Request) {
 	// One snapshot for the whole request. If membership changes mid-request,
 	// this request finishes against the view it started with.
 	v := rt.cfg.View.Load()
-	live := liveReplicas(v, key, rt.cfg.N)
+	live := rt.candidates(v, key)
 	if len(live) == 0 {
 		// Gossip says every replica is down. Don't dial any of them, don't
 		// wait for a timeout, and don't send a request one might process late.
 		first := v.PreferenceList(key, 1)[0]
 		w.Header().Set(OwnerHeader, first)
-		http.Error(w, fmt.Sprintf("all %d replicas of this key are down", rt.cfg.N), http.StatusServiceUnavailable)
+		msg := fmt.Sprintf("all %d replicas of this key are down", rt.cfg.N)
+		if rt.cfg.Sloppy {
+			msg = "every node is down"
+		}
+		http.Error(w, msg, http.StatusServiceUnavailable)
 		return
 	}
 	for i, id := range live {
@@ -170,16 +178,22 @@ func liveReplicas(v *cluster.View, key string, n int) []string {
 	return out
 }
 
-// coordinator is the first of key's n replicas that gossip doesn't say is
-// down. Every node with the same view picks the same one, so writes to a
-// key normally meet at one node, which orders them.
-func coordinator(v *cluster.View, key string, n int) (string, bool) {
-	for _, id := range v.PreferenceList(key, n) {
-		if !v.Down(id) {
-			return id, true
+// candidates is where a request for key may go, in order: its live
+// replicas, then, when sloppy, every other node gossip doesn't say is down,
+// in the key's preference order. The first is the coordinator. Every node
+// with the same view picks the same one, so writes to a key normally meet
+// at one node, which orders them.
+func (rt *router) candidates(v *cluster.View, key string) []string {
+	live := liveReplicas(v, key, rt.cfg.N)
+	if rt.cfg.Sloppy {
+		all := v.PreferenceList(key, len(v.Nodes()))
+		for _, id := range all[min(rt.cfg.N, len(all)):] {
+			if !v.Down(id) {
+				live = append(live, id)
+			}
 		}
 	}
-	return "", false
+	return live
 }
 
 // internal serves a request that another node forwarded here. It never
@@ -353,7 +367,10 @@ func (rt *router) owner(w http.ResponseWriter, r *http.Request) {
 	}
 	v := rt.cfg.View.Load()
 	id, addr := v.Owner(key)
-	coord, _ := coordinator(v, key, rt.cfg.N) // "" when every replica is down
+	var coord string // "" when every candidate is down
+	if live := rt.candidates(v, key); len(live) > 0 {
+		coord = live[0]
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ownerResponse{
 		Key:            key,

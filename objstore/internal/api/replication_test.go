@@ -33,6 +33,10 @@ type rnode struct {
 	store *store.Store
 	srv   *httptest.Server
 	cut   atomic.Bool // while set, every request gets 503: as if partitioned away
+	// hung, while set, holds every request until the test ends: as if the
+	// node were frozen, its socket open and nothing answering.
+	hung    atomic.Bool
+	release chan struct{}
 	// turnedAway counts the version pushes refused while cut off, so a test
 	// can wait for a coordinator's background push to have really failed.
 	turnedAway atomic.Int32
@@ -79,11 +83,18 @@ func (n *rnode) addr() string          { return n.srv.Listener.Addr().String() }
 // test sends a request to is that request's coordinator.
 func replicated(t *testing.T, count, n, r, w int) []*rnode {
 	t.Helper()
+	return replicatedWith(t, count, n, r, w, nil)
+}
+
+// replicatedWith is replicated with a chance to adjust each node's API
+// configuration first.
+func replicatedWith(t *testing.T, count, n, r, w int, tweak func(*Config)) []*rnode {
+	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nodes := make([]*rnode, count)
 	addrs := map[string]string{}
 	for i := range nodes {
-		nd := &rnode{id: fmt.Sprintf("n%d", i+1)}
+		nd := &rnode{id: fmt.Sprintf("n%d", i+1), release: make(chan struct{})}
 		s, err := store.Open(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
@@ -100,13 +111,25 @@ func replicated(t *testing.T, count, n, r, w int) []*rnode {
 			t.Fatal(err)
 		}
 		nd.view, nd.addrs, nd.hints = cluster.NewHolder(v), addrs, &recordedHints{}
-		h := Handler(Config{Store: nd.store, NodeID: nd.id, Log: log,
-			View: nd.view, N: n, R: r, W: w, Peers: peers, Hints: nd.hints})
+		cfg := Config{Store: nd.store, NodeID: nd.id, Log: log,
+			View: nd.view, N: n, R: r, W: w, Peers: peers, Hints: nd.hints}
+		if tweak != nil {
+			tweak(&cfg)
+		}
+		h := Handler(cfg)
 		mux := http.NewServeMux()
 		mux.Handle("/internal/", http.StripPrefix("/internal", h))
 		mux.Handle("/", h)
 		nd := nd
 		nd.srv.Config.Handler = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			if nd.hung.Load() {
+				select {
+				case <-nd.release:
+				case <-req.Context().Done():
+				}
+				http.Error(rw, "frozen", http.StatusServiceUnavailable)
+				return
+			}
 			if nd.cut.Load() {
 				if req.Method == http.MethodPut && strings.HasPrefix(req.URL.Path, "/internal/versions/") {
 					nd.turnedAway.Add(1)
@@ -119,6 +142,7 @@ func replicated(t *testing.T, count, n, r, w int) []*rnode {
 		})
 		nd.srv.Start()
 		t.Cleanup(nd.srv.Close)
+		t.Cleanup(func() { close(nd.release) }) // runs first: frees hung requests so Close can finish
 	}
 	return nodes
 }

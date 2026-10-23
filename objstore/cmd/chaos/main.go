@@ -29,6 +29,7 @@ func main() {
 	flag.IntVar(&cfg.W, "w", 2, "replicas that must acknowledge a write")
 	flag.IntVar(&cfg.TransferMB, "transfer-mb", 50, "each node's background transfer rate in MB/s; 0 means unlimited")
 	flag.BoolVar(&cfg.Hints, "hints", true, "whether writes record hints for replicas they miss")
+	flag.BoolVar(&cfg.Sloppy, "sloppy", false, "sloppy quorums: nodes past a key's replicas stand in for unreachable ones")
 	flag.DurationVar(&cfg.AntiEntropy, "anti-entropy", 5*time.Second, "how often replicas compare; 0 turns anti-entropy off")
 	flag.DurationVar(&cfg.Settle, "settle", time.Minute, "the longest to wait after healing for every acknowledged write to reach all its replicas")
 	flag.DurationVar(&cfg.Duration, "duration", time.Minute, "how long traffic and faults run")
@@ -83,6 +84,9 @@ func main() {
 	fmt.Printf("replicas: %d acknowledged writes missing from at least one of their key's replicas; converged: %s\n",
 		len(rep.UnderReplicated), converged)
 	fmt.Printf("dots:     %d acknowledged writes reused another's dot\n", len(rep.Duplicates))
+	if cfg.Sloppy {
+		fmt.Printf("handback: %d keys still held by a stand-in outside their replicas\n", rep.StandInsLeft)
+	}
 	fmt.Printf("RESULT:   %d of %d acknowledged writes lost; %d not reflected by a quorum read\n",
 		len(rep.Lost), rep.WritesAcked, len(rep.Invisible))
 	for i, a := range rep.Lost {

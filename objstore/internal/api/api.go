@@ -24,6 +24,15 @@
 // A write that reaches fewer than W replicas answers 503. That does not mean
 // it failed: it may be stored on some replicas, and will spread from there.
 //
+// With Sloppy set, a replica that can't be reached is replaced by a stand-in:
+// the next node clockwise past the key's N replicas that gossip doesn't say
+// is down (Dynamo's sloppy quorum). The stand-in's copy counts toward W, and
+// its answer toward R. A stand-in holds the key outside its replica set, so
+// the handoff pass delivers it to all N replicas once they answer, and only
+// then deletes it. Writes keep succeeding while most of a key's replicas are
+// down; the price is that R + W > N no longer guarantees a read sees every
+// acknowledged write, until the stand-ins have handed their copies back.
+//
 // Replicas that miss a write are caught up two ways. The coordinator records
 // a hint for each replica its push failed to reach, for the handoff pass to
 // deliver when that replica answers again. And every read repairs: a replica
@@ -80,6 +89,9 @@ type Config struct {
 	// Hints records replicas a write's push failed to reach. Nil means a
 	// missed push is simply missed.
 	Hints Hinter
+	// Sloppy lets stand-ins, nodes past a key's N replicas, take the place
+	// of replicas that can't be reached, for writes and reads alike.
+	Sloppy bool
 }
 
 // Hinter records that a replica may be missing a key. handoff.Hints is one.
@@ -130,6 +142,62 @@ func (h *handler) replicas(key string) (*cluster.View, []string) {
 	}
 	v := h.View.Load()
 	return v, v.PreferenceList(key, h.N)
+}
+
+// standIns hands out, once each, the nodes that may stand in for key's
+// unreachable replicas: every node past the first N in the key's preference
+// order that gossip doesn't say is down. A stand-in is only ever a bonus, so
+// unlike a replica, one marked down is never tried.
+type standIns struct {
+	mu   sync.Mutex
+	left []string
+}
+
+// standInsFor returns key's stand-ins, or nil if this handler isn't sloppy.
+// This node is one when it isn't a replica: a request lands on a node outside
+// the replica set only when the router found every replica unreachable.
+func (h *handler) standInsFor(v *cluster.View, key string) *standIns {
+	if !h.Sloppy || v == nil {
+		return nil
+	}
+	all := v.PreferenceList(key, len(v.Nodes()))
+	s := &standIns{}
+	for _, id := range all[min(h.N, len(all)):] {
+		if !v.Down(id) {
+			s.left = append(s.left, id)
+		}
+	}
+	return s
+}
+
+// next returns the next unused stand-in, if any is left.
+func (s *standIns) next() (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.left) == 0 {
+		return "", false
+	}
+	id := s.left[0]
+	s.left = s.left[1:]
+	return id, true
+}
+
+// take removes id from the stand-ins, reporting whether it was one.
+func (s *standIns) take(id string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := slices.Index(s.left, id)
+	if i < 0 {
+		return false
+	}
+	s.left = slices.Delete(s.left, i, i+1)
+	return true
 }
 
 func versionsOf(ms []store.Meta) []version.Version {
@@ -224,12 +292,18 @@ const stragglerTimeout = 5 * time.Second
 func (h *handler) gather(ctx context.Context, key string) ([]store.Meta, map[version.Dot][]string, []string, error) {
 	v, rs := h.replicas(key)
 	need := min(h.R, len(rs))
+	spare := h.standInsFor(v, key)
 	type reply struct {
 		id  string
 		ms  []store.Meta
 		err error
 	}
-	replies := make(chan reply, len(rs))
+	// Every node is asked at most once: the replicas, and stand-ins.
+	nodes := len(rs)
+	if v != nil {
+		nodes = len(v.Nodes())
+	}
+	replies := make(chan reply, nodes)
 	// Every replica is asked; the answer goes back once R have replied. The
 	// slower ones are left to finish rather than cut off when this request
 	// ends: cancelling a request mid-flight makes Go throw its connection
@@ -237,29 +311,53 @@ func (h *handler) gather(ctx context.Context, key string) ([]store.Meta, map[ver
 	// Their answers are small, and the timeout bounds a stuck replica.
 	lists, stop := context.WithTimeout(context.WithoutCancel(ctx), stragglerTimeout)
 	var pending sync.WaitGroup
-	for _, id := range rs {
+	// Held until gather returns, since a stand-in may be asked at any point
+	// until then; only after that may the last listing release the timeout.
+	pending.Add(1)
+	defer pending.Done()
+	go func() { pending.Wait(); stop() }()
+	asked := 0
+	ask := func(id string) {
+		asked++
 		pending.Add(1)
-		switch {
-		case id == h.NodeID:
+		if id == h.NodeID {
 			go func() {
 				defer pending.Done()
 				ms, err := h.Store.Siblings(key)
 				replies <- reply{id, ms, err}
 			}()
-		default:
-			addr, _ := v.Addr(id)
-			go func(id, addr string) {
-				defer pending.Done()
-				ms, err := h.Peers.List(lists, addr, key)
-				replies <- reply{id, ms, err}
-			}(id, addr)
+			return
+		}
+		addr, _ := v.Addr(id)
+		go func() {
+			defer pending.Done()
+			ms, err := h.Peers.List(lists, addr, key)
+			replies <- reply{id, ms, err}
+		}()
+	}
+	// askStandIn asks the next stand-in, if one is left.
+	askStandIn := func() {
+		if id, ok := spare.next(); ok {
+			ask(id)
 		}
 	}
-	go func() { pending.Wait(); stop() }()
+	// This node answers first when it is a stand-in itself: whatever it
+	// holds for the key, it may be the only copy.
+	if spare.take(h.NodeID) {
+		ask(h.NodeID)
+	}
+	for _, id := range rs {
+		ask(id)
+		if spare != nil && v.Down(id) {
+			// Don't wait to learn that a replica gossip calls down is: a
+			// frozen one answers only when the timeout gives up on it.
+			askStandIn()
+		}
+	}
 	var all []store.Meta
 	holders := map[version.Dot][]string{}
 	var answered []string
-	for got := 0; got < len(rs) && len(answered) < need; got++ {
+	for got := 0; got < asked && len(answered) < need; got++ {
 		var rp reply
 		select {
 		case rp = <-replies:
@@ -268,6 +366,7 @@ func (h *handler) gather(ctx context.Context, key string) ([]store.Meta, map[ver
 		}
 		if rp.err != nil {
 			h.Log.Debug("gather: replica did not answer", "key", key, "replica", rp.id, "err", rp.err)
+			askStandIn()
 			continue
 		}
 		answered = append(answered, rp.id)
@@ -286,13 +385,17 @@ func (h *handler) gather(ctx context.Context, key string) ([]store.Meta, map[ver
 // lacks — reading each value from here if this node holds it, otherwise
 // from a replica that does. It runs in the background, after the read: the
 // client never waits for it. Replicas that didn't answer in time aren't
-// touched; hints and later reads cover them.
+// touched; hints and later reads cover them. Nor are stand-ins that
+// answered: a copy given to one would only have to be handed back.
 func (h *handler) repair(ctx context.Context, key string, sibs []store.Meta, holders map[version.Dot][]string, answered []string) {
 	if h.View == nil {
 		return // a lone node has no one to repair
 	}
-	v := h.View.Load()
+	v, rs := h.replicas(key)
 	for _, id := range answered {
+		if !slices.Contains(rs, id) {
+			continue
+		}
 		for _, m := range sibs {
 			if slices.Contains(holders[m.Version.Dot], id) {
 				continue
@@ -445,7 +548,10 @@ func (h *handler) getVersion(w http.ResponseWriter, r *http.Request, key, v stri
 	// Not here: ask the key's replicas. They answer from /versions, which
 	// only reads their own disks, so this can never bounce between nodes.
 	if h.View != nil {
-		_, rs := h.replicas(key)
+		v, rs := h.replicas(key)
+		if h.Sloppy {
+			rs = v.PreferenceList(key, len(v.Nodes())) // a stand-in may hold it
+		}
 		if rc, size, err := h.openValue(r.Context(), key, d, rs); err == nil {
 			defer rc.Close()
 			h.stream(w, key, rc, d, size)
@@ -471,10 +577,15 @@ func (h *handler) stream(w http.ResponseWriter, key string, rc io.Reader, d vers
 // replicateWrite sends a version just stored here to key's other replicas,
 // and returns once W replicas — counting this one — have it, or once every
 // replica has answered. The remaining pushes carry on after it returns.
+//
+// When sloppy, a replica that can't take the write is replaced by a stand-in,
+// whose copy counts in its place; and this node's own copy counts even when
+// it isn't a replica, because it is then a stand-in itself.
 func (h *handler) replicateWrite(ctx context.Context, key string, m store.Meta) (acks, need int) {
 	v, rs := h.replicas(key)
 	need = min(h.W, len(rs))
-	if slices.Contains(rs, h.NodeID) {
+	spare := h.standInsFor(v, key)
+	if slices.Contains(rs, h.NodeID) || spare.take(h.NodeID) {
 		acks = 1 // the local write
 	}
 	var others []string
@@ -493,18 +604,7 @@ func (h *handler) replicateWrite(ctx context.Context, key string, m store.Meta) 
 	bg := context.WithoutCancel(ctx)
 	// Every replica, even those marked down: see liveFirst.
 	for _, id := range others {
-		addr, _ := v.Addr(id)
-		go func(id, addr string) {
-			err := h.pushStored(bg, addr, key, m)
-			if err != nil && h.Hints != nil {
-				// Record before reporting the failure, so a write answered
-				// 503 already has its hint.
-				if herr := h.Hints.Record(id, key); herr != nil {
-					h.hintNotRecorded(id, key, herr)
-				}
-			}
-			results <- err
-		}(id, addr)
+		go func(id string) { results <- h.replicateTo(bg, v, key, m, id, spare) }(id)
 	}
 	for i := 0; i < len(others) && acks < need; i++ {
 		if err := <-results; err == nil {
@@ -514,6 +614,61 @@ func (h *handler) replicateWrite(ctx context.Context, key string, m store.Meta) 
 		}
 	}
 	return acks, need
+}
+
+// replicateTo gives replica id the version m, or, when sloppy and id can't
+// take it, a stand-in in its place. It returns nil once one of them has it.
+func (h *handler) replicateTo(ctx context.Context, v *cluster.View, key string, m store.Meta, id string, spare *standIns) error {
+	push := func() error {
+		addr, _ := v.Addr(id)
+		err := h.pushStored(ctx, addr, key, m)
+		if err != nil && h.Hints != nil {
+			// Record before reporting the failure, so a write answered
+			// 503 already has its hint.
+			if herr := h.Hints.Record(id, key); herr != nil {
+				h.hintNotRecorded(id, key, herr)
+			}
+		}
+		return err
+	}
+	if spare == nil {
+		return push()
+	}
+	if !v.Down(id) {
+		err := push()
+		if err == nil {
+			return nil
+		}
+		if serr := h.pushToStandIn(ctx, v, key, m, spare); serr == nil {
+			return nil
+		}
+		return err
+	}
+	// Gossip says id is down. Push to it anyway, in case gossip is wrong,
+	// but don't wait to find out before asking a stand-in: a frozen replica
+	// fails only when the timeout gives up on it.
+	replicaErr := make(chan error, 1)
+	go func() { replicaErr <- push() }()
+	if h.pushToStandIn(ctx, v, key, m, spare) == nil {
+		return nil
+	}
+	return <-replicaErr
+}
+
+// pushToStandIn gives m to the next stand-in that takes it.
+func (h *handler) pushToStandIn(ctx context.Context, v *cluster.View, key string, m store.Meta, spare *standIns) error {
+	err := errors.New("no stand-in left")
+	for {
+		id, ok := spare.next()
+		if !ok {
+			return err
+		}
+		addr, _ := v.Addr(id)
+		if err = h.pushStored(ctx, addr, key, m); err == nil {
+			h.Log.Debug("replicate: stand-in took the write", "key", key, "version", m.Version.Dot, "stand_in", id)
+			return nil
+		}
+	}
 }
 
 // hintNotRecorded reports a hint that couldn't be recorded. A full store is

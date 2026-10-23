@@ -50,6 +50,7 @@ func run() error {
 		hintWindow = flag.Duration("hint-window", 3*time.Hour, "how long a hint is kept before anti-entropy is left to repair it")
 		maxHints   = flag.Int("max-hints", 100_000, "the most hints kept at once; below zero means no limit")
 		sweep      = flag.Duration("handoff-interval", 0, "how often handoff sweeps between membership changes (default 30s)")
+		sloppy     = flag.Bool("sloppy", false, "sloppy quorums: nodes past a key's replicas stand in for unreachable ones")
 	)
 	flag.Parse()
 	if *id == "" || *data == "" {
@@ -89,6 +90,7 @@ func run() error {
 		NoHints:             !*hints,
 		HintWindow:          *hintWindow,
 		MaxHints:            *maxHints,
+		Sloppy:              *sloppy,
 		Log:                 log,
 		HandoffInterval:     *sweep,
 	})

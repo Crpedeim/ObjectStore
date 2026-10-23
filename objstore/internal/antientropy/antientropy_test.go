@@ -2,6 +2,7 @@ package antientropy
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -133,13 +134,20 @@ func TestIdenticalReplicasCostOneRequest(t *testing.T) {
 	}
 }
 
+// sharedKeys sizes TestOneDifferenceCostsAFractionOfAFullListing. Measure a
+// bigger store with: go test -run OneDifference -v ./internal/antientropy -args -shared-keys 10000
+var sharedKeys = flag.Int("shared-keys", 2000, "keys both replicas hold in the one-difference test (at least 1000)")
+
 // The point of the tree. Two thousand keys agree, one doesn't. The exchange
 // walks one path to one leaf, compares one bucket, and repairs one key — for
 // a small fraction of the bytes a full listing would cost.
 func TestOneDifferenceCostsAFractionOfAFullListing(t *testing.T) {
+	if *sharedKeys < 1000 {
+		t.Fatalf("-shared-keys %d: the test changes k999, so it needs at least 1000", *sharedKeys)
+	}
 	nodes := startNodes(t, 2, "a", "b")
 	a, b := nodes["a"].store, nodes["b"].store
-	for i := 0; i < 2000; i++ {
+	for i := 0; i < *sharedKeys; i++ {
 		k := fmt.Sprintf("k%d", i)
 		old := meta("w.1", uint64(i+1))
 		store1(t, a, k, old, "old")
@@ -152,8 +160,8 @@ func TestOneDifferenceCostsAFractionOfAFullListing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("2000 shared keys, 1 different: %d requests, %d bytes exchanged, against %d for a full listing (%.2f%%)",
-		st.Requests, st.BytesExchanged, st.BytesFullListing, 100*float64(st.BytesExchanged)/float64(st.BytesFullListing))
+	t.Logf("%d shared keys, 1 different: %d requests, %d bytes exchanged, against %d for a full listing (%.2f%%)",
+		*sharedKeys, st.Requests, st.BytesExchanged, st.BytesFullListing, 100*float64(st.BytesExchanged)/float64(st.BytesFullListing))
 	if st.LeavesDiffering != 1 || st.KeysDiffering != 1 || st.Pulled != 1 || st.Pushed != 0 {
 		t.Fatalf("stats %+v; want one leaf, one key, one version pulled", st)
 	}
