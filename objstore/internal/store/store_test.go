@@ -976,3 +976,57 @@ func TestSiblingsNeverMissesAKeyBeingOverwritten(t *testing.T) {
 		}
 	}
 }
+
+// A version whose past is too long for a version file to hold is refused,
+// and the key stays readable and writable. Stored, it would be read back as
+// corrupt, and break every later read and write of the key.
+func TestVersionTooLargeIsRefusedNotStored(t *testing.T) {
+	s := newStore(t)
+	put(t, s, "k", "v1")
+	// Two halves, each short enough to parse, together too long.
+	var halves [2]version.Context
+	for h := range halves {
+		var b strings.Builder
+		for i := 0; b.Len() < version.MaxEncodedLen*3/4; i++ {
+			fmt.Fprintf(&b, "&node-%d-%d=1", h, i)
+		}
+		c, err := version.ParseContext(b.String()[1:] + "|")
+		if err != nil {
+			t.Fatal(err)
+		}
+		halves[h] = c
+	}
+	past := halves[0].Merge(halves[1])
+	huge := Meta{Version: version.Version{Dot: version.Dot{Actor: "w.1", Counter: 1}, Past: past}}
+	if _, _, err := s.Write("k", replicate(huge), strings.NewReader("v2")); !errors.Is(err, ErrVersionTooLarge) {
+		t.Fatalf("writing a version with a %d-byte past: %v; want ErrVersionTooLarge", len(past.String()), err)
+	}
+	if got := value(t, s, "k"); got != "v1" {
+		t.Fatalf("after the refused write the key reads %q", got)
+	}
+	put(t, s, "k", "v3")
+}
+
+// One damaged version file mustn't stop a walk: handoff and anti-entropy
+// walk the whole store, and would stop working for every key. The damaged
+// key is skipped, every other key visited, and the damage reported.
+func TestWalkSkipsADamagedKeyAndVisitsTheRest(t *testing.T) {
+	s := newStore(t)
+	for _, k := range []string{"a", "b", "c", "d"} {
+		put(t, s, k, "v")
+	}
+	m, _ := s.Siblings("b")
+	f, _ := os.OpenFile(s.versionPath("b", m[0].Version.Dot), os.O_WRONLY, 0)
+	f.WriteAt([]byte("XXXX"), 0)
+	f.Close()
+
+	var got []string
+	err := s.Walk(func(k string) error { got = append(got, k); return nil })
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"a", "c", "d"}) {
+		t.Fatalf("Walk visited %q; want every key but the damaged one", got)
+	}
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Walk returned %v; want the damage reported", err)
+	}
+}

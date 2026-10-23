@@ -69,18 +69,28 @@ func OpenHints(dir string, max int) (*Hints, error) {
 		return nil, fmt.Errorf("hints: %w", err)
 	}
 	h := &Hints{dir: dir, max: max, session: fmt.Sprintf("%x", time.Now().UnixNano())}
-	// Count what a previous run left, so the limit holds across restarts.
+	// Count what a previous run left, so the limit holds across restarts, and
+	// remove the temp files of recordings a crash interrupted. Only now can a
+	// temp file be known to be one: once this node runs, a temp file may
+	// belong to a Record in progress.
 	targets, err := h.Targets()
 	if err != nil {
 		return nil, err
 	}
 	for _, node := range targets {
-		entries, err := os.ReadDir(h.nodeDir(node))
+		d := h.nodeDir(node)
+		entries, err := os.ReadDir(d)
 		if err != nil {
 			return nil, fmt.Errorf("hints: %w", err)
 		}
 		for _, e := range entries {
-			if !e.IsDir() && !strings.Contains(e.Name(), ".tmp-") {
+			switch {
+			case e.IsDir():
+			case strings.Contains(e.Name(), ".tmp-"):
+				if err := os.Remove(filepath.Join(d, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return nil, fmt.Errorf("hints: %w", err)
+				}
+			default:
 				h.count++
 			}
 		}
@@ -178,8 +188,7 @@ func (h *Hints) Pending(node string) ([]Hint, error) {
 	for _, e := range entries {
 		name := e.Name()
 		if strings.Contains(name, ".tmp-") {
-			os.Remove(filepath.Join(d, name)) // a crash mid-write left it
-			continue
+			continue // a Record in progress; or a crash's, which OpenHints removes
 		}
 		b, err := os.ReadFile(filepath.Join(d, name))
 		if err != nil {

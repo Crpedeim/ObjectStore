@@ -46,9 +46,19 @@ type attempt struct {
 	tries int
 }
 
+// DefaultHeaderTimeout bounds the wait for a node's response headers. A node
+// that is frozen — its sockets open, nothing answering — would otherwise hold
+// every request sent to it until it woke. A node answers a write only once
+// it is fsynced on W replicas, so this is generous.
+const DefaultHeaderTimeout = 30 * time.Second
+
 // New balances across addrs (host:port each), all assumed healthy until a
 // check says otherwise.
 func New(addrs []string, log *slog.Logger) *Balancer {
+	return newBalancer(addrs, log, DefaultHeaderTimeout)
+}
+
+func newBalancer(addrs []string, log *slog.Logger, headerTimeout time.Duration) *Balancer {
 	b := &Balancer{probe: &http.Client{Timeout: time.Second}, log: log}
 	for _, a := range addrs {
 		be := &backend{addr: a, url: &url.URL{Scheme: "http", Host: a}}
@@ -60,6 +70,7 @@ func New(addrs []string, log *slog.Logger) *Balancer {
 	// connection; under load that's most of them.
 	pool := http.DefaultTransport.(*http.Transport).Clone()
 	pool.MaxIdleConns, pool.MaxIdleConnsPerHost = 1024, 256
+	pool.ResponseHeaderTimeout = headerTimeout
 	b.proxy = &httputil.ReverseProxy{
 		Transport: pool,
 		Rewrite: func(pr *httputil.ProxyRequest) {

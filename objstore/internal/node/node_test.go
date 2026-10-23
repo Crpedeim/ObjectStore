@@ -1238,8 +1238,9 @@ func staleOn(t *testing.T, back, observer *testNode, keys []string, id string) (
 
 func sloppy(c *Config) { c.Sloppy = true }
 
-// TestTwoReplicasDownLosesQuorum with sloppy quorums: two of a key's three
-// replicas down, and every read and write of it still succeeds, the writes
+// Where TestTwoReplicasDownLosesQuorum loses quorums, sloppy ones don't: two
+// of a key's three replicas down, and every read and write of it still
+// succeeds, the writes
 // landing on stand-ins. When the replicas come back, the stand-ins hand
 // their copies over and drop them: every key ends on exactly its three
 // replicas, at its latest value.
@@ -1304,5 +1305,58 @@ func TestSloppyQuorumSurvivesTwoReplicasDown(t *testing.T) {
 		if code, body, _ := get(t, nodes[i%len(nodes)].url(k)); code != http.StatusOK || body != "updated-"+k {
 			t.Fatalf("after healing, %s: %d %q", k, code, body)
 		}
+	}
+}
+
+// A node that loses its disk and comes back under its old name must not
+// reuse its old version names. Its store starts again from scratch, and if
+// its epochs did too, its first write here would get the very dot its old
+// self gave an earlier one: the other replicas, holding that dot already,
+// would take the new write for a duplicate, keep the old value, and still
+// acknowledge it.
+func TestNodeBackWithAnEmptyDiskDoesNotReuseVersions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in -short")
+	}
+	nodes := startReplicated(t, 3, 3, 2, 2)
+	victim := nodes[1]
+	// A write coordinated by the victim, so its dot names it.
+	code, hdr := sendWith(t, http.MethodPut, "http://"+victim.Addr()+"/internal/objects/k", "old", nil)
+	if code != http.StatusCreated {
+		t.Fatalf("first write: %d", code)
+	}
+	first := hdr.Get("X-Objstore-Version")
+	waitForCopies(t, nodes, []string{"k"}, 3)
+
+	victim.Crash()
+	waitFor(t, victim.id+" marked down", func() bool { return nodes[0].View().Down(victim.id) })
+	back := startNRW(t, victim.id, t.TempDir(), victim.gossip, 3, 2, 2, nodes[0].gossip)
+	waitFor(t, victim.id+" back up", func() bool { return !nodes[0].View().Down(victim.id) })
+
+	// A write that has seen nothing — a header present but empty — needs no
+	// quorum read, so all the new node knows of the key is its empty disk.
+	code, hdr = sendWith(t, http.MethodPut, "http://"+back.Addr()+"/internal/objects/k", "new", map[string]string{"X-Objstore-Context": ""})
+	if code != http.StatusCreated {
+		t.Fatalf("write after the disk was lost: %d", code)
+	}
+	second := hdr.Get("X-Objstore-Version")
+	if second == first {
+		t.Fatalf("the node back with an empty disk named its write %s, as its old self named an earlier one", second)
+	}
+	d, err := version.ParseDot(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nd := range []*testNode{nodes[0], back, nodes[2]} {
+		nd := nd
+		waitFor(t, nd.id+" holds the new write", func() bool {
+			rc, _, err := nd.Store().Open("k", d)
+			if err != nil {
+				return false
+			}
+			defer rc.Close()
+			b, _ := io.ReadAll(rc)
+			return string(b) == "new"
+		})
 	}
 }

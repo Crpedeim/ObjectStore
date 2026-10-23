@@ -132,6 +132,21 @@ func Start(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	if st.Fresh() && g.KnownBefore() {
+		// This node lost its disk and came back under its old name. Its
+		// epochs started again from 1, so its writes would reuse the names
+		// its old self gave writes the other replicas still hold, and they
+		// would drop the new ones as duplicates. Move past every epoch the
+		// old store can have used: one epoch costs at least a couple of
+		// fsyncs, so it has used fewer than one a millisecond.
+		epoch, err := st.EpochAtLeast(uint64(time.Now().UnixMilli()))
+		if err != nil {
+			g.Shutdown()
+			return nil, err
+		}
+		cfg.Log.Warn("this node's data directory is new, but the cluster knew a node by its name: "+
+			"starting its epochs afresh", "epoch", epoch)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /cluster/members", g.MembersHandler())

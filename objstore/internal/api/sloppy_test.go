@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Crpedeim/objstore/internal/store"
 	"github.com/Crpedeim/objstore/internal/version"
 )
 
@@ -124,13 +125,12 @@ func TestSloppyReadRepairLeavesStandInsAlone(t *testing.T) {
 
 // A replica gossip calls down may be frozen: its socket open, nothing
 // answering until a timeout gives up on it. A sloppy write doesn't wait for
-// that; it asks a stand-in at once. Here W=3 needs both stand-ins, one of
-// them in place of the frozen replica, so waiting for it would take the
-// whole timeout.
+// that; it asks a stand-in at once. Here W=3 needs a stand-in in place of
+// the frozen replica, and nothing else fails to set one off, so waiting for
+// the replica would take the whole timeout.
 func TestSloppyWriteDoesNotWaitForAReplicaGossipCallsDown(t *testing.T) {
 	nodes := replicatedWith(t, 5, 3, 1, 3, sloppy)
 	reps := replicasOf(t, nodes, "k", 3)
-	reps[1].cut.Store(true)
 	reps[2].hung.Store(true)
 	reps[0].believeDown(t, reps[2].id)
 
@@ -144,14 +144,13 @@ func TestSloppyWriteDoesNotWaitForAReplicaGossipCallsDown(t *testing.T) {
 	}
 }
 
-// The same for a read: R=3 needs both stand-ins, one of them in place of a
-// frozen replica that gossip calls down. Waiting for it would take the
-// whole listing timeout.
+// The same for a read: R=3 needs a stand-in in place of a frozen replica
+// that gossip calls down. Waiting for it would take the whole listing
+// timeout.
 func TestSloppyReadDoesNotWaitForAReplicaGossipCallsDown(t *testing.T) {
 	nodes := replicatedWith(t, 5, 3, 3, 1, sloppy)
 	reps := replicasOf(t, nodes, "k", 3)
 	putEverywhere(t, reps, "k", "v")
-	reps[1].cut.Store(true)
 	reps[2].hung.Store(true)
 	reps[0].believeDown(t, reps[2].id)
 
@@ -189,5 +188,70 @@ func TestSloppyWriteWithNoStandInLeft(t *testing.T) {
 	code, body, _ := req(t, http.MethodPut, reps[0].url("k"), "v", nil)
 	if code != http.StatusServiceUnavailable || !strings.Contains(body, "1 of 2") {
 		t.Fatalf("PUT with no one to stand in: %d %q", code, body)
+	}
+}
+
+// Stand-ins count toward a quorum only in place of replicas that can't
+// answer, and only once every healthy replica has had its say. Here the
+// coordinator missed a write that reps[1] and reps[2] hold; reps[2] is down,
+// and reps[1] answers slowly. Two stand-ins hold nothing and answer fast, so
+// counting them as soon as they answer would make a quorum that says the
+// key doesn't exist. The read must wait for reps[1] instead, and find it.
+func TestSloppyReadWaitsForAHealthyReplicaOverStandIns(t *testing.T) {
+	nodes := replicatedWith(t, 5, 3, 2, 2, sloppy)
+	reps := replicasOf(t, nodes, "k", 3)
+	v1 := newerThan(http.Header{}, "elsewhere.1")
+	pushTo(t, "k", v1, "acknowledged", reps[1], reps[2])
+	reps[2].cut.Store(true)
+	reps[0].believeDown(t, reps[2].id)
+	reps[1].listLate.Store(int64(300 * time.Millisecond))
+
+	if code, body, _ := req(t, http.MethodGet, reps[0].url("k"), "", nil); code != http.StatusOK || body != "acknowledged" {
+		t.Fatalf("GET: %d %q; want the write reps[1] holds", code, body)
+	}
+	if code, _, _ := req(t, http.MethodPut, reps[0].url("k"), "x", map[string]string{"If-None-Match": "*"}); code != http.StatusPreconditionFailed {
+		t.Fatalf("create-only PUT: %d; want 412, the key exists", code)
+	}
+}
+
+// The same for a write: with a healthy replica still to answer, a stand-in's
+// ack doesn't count yet. Here reps[2] is down and has a stand-in at once,
+// but reps[1] is healthy and slow, and W=2 waits for it.
+func TestSloppyWriteWaitsForAHealthyReplicaOverAStandIn(t *testing.T) {
+	nodes := replicatedWith(t, 5, 3, 1, 2, sloppy)
+	reps := replicasOf(t, nodes, "k", 3)
+	reps[2].cut.Store(true)
+	reps[0].believeDown(t, reps[2].id)
+	reps[1].pushLate.Store(int64(300 * time.Millisecond))
+
+	code, _, hdr := req(t, http.MethodPut, reps[0].url("k"), "v", nil)
+	mustBe(t, "PUT", code, http.StatusCreated)
+	if !holds(t, reps[1], "k", hdr.Get(VersionHeader)) {
+		t.Fatal("acknowledged before the healthy replica had it: a stand-in counted in its place")
+	}
+}
+
+// A sloppy read of one version looks on the replicas and the stand-ins —
+// but, as everywhere, never on a stand-in gossip calls down. Here the only
+// such node is frozen: asking it would hold the answer for a timeout.
+func TestSloppyVersionReadSkipsStandInsMarkedDown(t *testing.T) {
+	nodes := replicatedWith(t, 5, 3, 2, 2, sloppy)
+	reps := replicasOf(t, nodes, "k", 3)
+	spares := standInsOf(t, nodes, "k", 3)
+	spares[0].hung.Store(true)
+	reps[0].believeDown(t, spares[0].id)
+
+	// A version on the other stand-in only is found there.
+	only := store.Meta{Version: version.Version{Dot: version.Dot{Actor: "elsewhere.1", Counter: 1}}}
+	pushTo(t, "k", only, "stood in", spares[1])
+	if code, body, _ := req(t, http.MethodGet, reps[0].url("k")+"?version=elsewhere.1:1", "", nil); code != http.StatusOK || body != "stood in" {
+		t.Fatalf("GET ?version= of a version a stand-in holds: %d %q", code, body)
+	}
+	start := time.Now()
+	if code, _, _ := req(t, http.MethodGet, reps[0].url("k")+"?version=nowhere.1:1", "", nil); code != http.StatusNotFound {
+		t.Fatalf("GET ?version= of a version nobody holds: %d", code)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("the 404 took %v: it waited for the frozen stand-in", took)
 	}
 }

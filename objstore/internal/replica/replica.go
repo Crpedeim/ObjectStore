@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"time"
@@ -83,15 +82,10 @@ func (c *Client) path(addr, endpoint, key string) string {
 	return "http://" + addr + (&url.URL{Path: "/internal/" + endpoint + "/" + key}).EscapedPath()
 }
 
-// guarded starts a stall guard whose cancellation ends ctx. Without a Stall
-// the guard never fires: a zero timeout would end every call at once.
+// guarded starts a stall guard whose cancellation ends ctx.
 func (c *Client) guarded(ctx context.Context) (context.Context, context.CancelCauseFunc, *stall.Guard) {
 	ctx, cancel := context.WithCancelCause(ctx)
-	timeout := c.Stall
-	if timeout <= 0 {
-		timeout = math.MaxInt64
-	}
-	return ctx, cancel, stall.NewGuard(timeout, cancel)
+	return ctx, cancel, stall.NewGuard(c.Stall, cancel)
 }
 
 func explain(ctx context.Context, err error) error {

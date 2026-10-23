@@ -15,6 +15,13 @@ cd "$(dirname "$0")/.."
 [[ $# -ge 3 ]] || { sed -n '2,/^set -euo/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 2; }
 label=$1 cluster=$2 load=$3 repeats=${4:-3}
 results=${RESULTS:-bench-results.jsonl}
+# Every run starts by deleting data/. A cluster running on it would lose its
+# data, and its nodes would keep the ports the new cluster needs.
+status=$( [[ -f data/nodes ]] && scripts/cluster.sh status 2>/dev/null || true)
+if [[ $status == *" running "* ]]; then
+	echo "bench: a cluster is running on data/, which each run deletes; stop it first: scripts/cluster.sh stop" >&2
+	exit 1
+fi
 go build -o bin/objbench ./cmd/objbench
 trap 'scripts/cluster.sh stop >/dev/null 2>&1 || true' EXIT
 for i in $(seq 1 "$repeats"); do

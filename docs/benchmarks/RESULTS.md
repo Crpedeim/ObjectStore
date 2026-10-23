@@ -165,42 +165,45 @@ not with the tables above. Four clients through the balancer, N=3 R=2 W=2; n2 an
 
 | second | strict: succeeded | strict: failed | sloppy: succeeded | sloppy: failed |
 |---|---|---|---|---|
-| 1 | 746 | 0 | 769 | 0 |
-| 2 | 838 | 0 | 802 | 0 |
-| 3 | 857 | 30 | 820 | 0 |
-| 4 | 742 | 361 | 679 | 4 |
-| 5 | 785 | 314 | 683 | 0 |
-| 6 | 720 | 333 | 703 | 0 |
-| 7 | 807 | 368 | 637 | 0 |
-| 8 | 787 | 361 | 691 | 0 |
-| 9 | 685 | 297 | 685 | 0 |
-| 10 | 784 | 326 | 688 | 0 |
-| 11 | 762 | 322 | 600 | 0 |
-| 12 | 630 | 265 | 709 | 0 |
-| 13 | 774 | 334 | 671 | 0 |
-| 14 | 677 | 0 | 412 | 0 |
-| 15 | 849 | 0 | 442 | 0 |
-| 16 | 888 | 0 | 561 | 0 |
-| 17 | 798 | 0 | 698 | 0 |
-| 18 | 878 | 0 | 718 | 0 |
-| 19 | 816 | 0 | 786 | 0 |
-| 20 | 894 | 0 | 789 | 0 |
-| 21 | 878 | 0 | 735 | 0 |
-| 22 | 864 | 0 | 735 | 0 |
-| 23 | 774 | 0 | 749 | 0 |
-| 24 | 833 | 0 | 717 | 0 |
-| 25 | 849 | 0 | 791 | 0 |
+| 1 | 796 | 0 | 776 | 0 |
+| 2 | 786 | 0 | 764 | 0 |
+| 3 | 753 | 78 | 758 | 2 |
+| 4 | 694 | 328 | 722 | 0 |
+| 5 | 697 | 302 | 720 | 0 |
+| 6 | 629 | 253 | 684 | 0 |
+| 7 | 686 | 329 | 640 | 0 |
+| 8 | 690 | 316 | 632 | 0 |
+| 9 | 675 | 301 | 629 | 0 |
+| 10 | 670 | 283 | 607 | 0 |
+| 11 | 688 | 292 | 615 | 0 |
+| 12 | 701 | 285 | 719 | 0 |
+| 13 | 622 | 246 | 514 | 0 |
+| 14 | 691 | 0 | 377 | 0 |
+| 15 | 800 | 0 | 369 | 0 |
+| 16 | 773 | 0 | 395 | 0 |
+| 17 | 828 | 0 | 492 | 0 |
+| 18 | 816 | 0 | 604 | 0 |
+| 19 | 695 | 0 | 673 | 0 |
+| 20 | 851 | 0 | 649 | 0 |
+| 21 | 766 | 0 | 731 | 0 |
+| 22 | 821 | 0 | 655 | 0 |
+| 23 | 817 | 0 | 726 | 0 |
+| 24 | 765 | 0 | 633 | 0 |
+| 25 | 745 | 0 | 614 | 0 |
 
-**Strict:** 3,308 requests answered 503 and 3 failed, all during the outage: about 30% of
+**Strict:** 3,011 requests answered 503 and 2 failed, all during the outage: about 30% of
 traffic, roughly the share of keys with two of their three replicas on n2 and n4. Every one of those
 keys still had a live replica, and the cluster three live nodes.
 
-**Sloppy:** 4 failed, the requests in flight at the instant of the kill, which no quorum setting can
+**Sloppy:** 2 failed, the requests in flight at the instant of the kill, which no quorum setting can
 save; none was refused for want of replicas. The price shows twice. During the outage successful
-throughput is about 10% lower: a write whose replicas are down also pushes to stand-ins. And it dips
-for a few seconds after the revival, while the stand-ins hand their copies back. Reads found 4
+throughput is about 15% lower: a write whose replicas are down also pushes to stand-ins. And it dips
+for a few seconds after the revival, while the stand-ins hand their copies back. Reads found 15
 conflicts: blind writes coordinated by a stand-in and by a replica are concurrent, so they become
 siblings, and a later read returns both.
+
+Measured after the fix to how stand-ins count (see the README's list of bugs found later); the first
+measurement, on the version with the bug, found the same availability, 3,308 against 0.
 
 Reproduce it with two terminals: `scripts/cluster.sh start [--sloppy]` and
 `bin/objbench -clients 4 -duration 25s -timeline` in one, `scripts/cluster.sh kill n2; scripts/cluster.sh kill n4`

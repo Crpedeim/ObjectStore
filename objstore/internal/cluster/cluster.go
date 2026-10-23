@@ -84,6 +84,21 @@ func (v *View) PreferenceList(key string, n int) []string {
 	return v.ring.PreferenceList(key, n)
 }
 
+// StandIns returns the nodes that may stand in for key's replicas when
+// quorums are sloppy: every node past its first n, in its preference order,
+// that isn't marked down. A stand-in is only ever a bonus, so unlike a
+// replica, one marked down is never tried.
+func (v *View) StandIns(key string, n int) []string {
+	all := v.ring.PreferenceList(key, len(v.addrs))
+	var out []string
+	for _, id := range all[min(n, len(all)):] {
+		if !v.down[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // Holder publishes the current View. Load is a single atomic read, so every
 // request can take a snapshot for free and use it start to finish. Watch
 // also returns a channel that closes when the View is replaced, so a

@@ -37,6 +37,12 @@ type rnode struct {
 	// node were frozen, its socket open and nothing answering.
 	hung    atomic.Bool
 	release chan struct{}
+	// listLate, when set, delays every reply to a listing of a key's
+	// versions by that long — the listing itself is taken at once, so what
+	// arrives late is what the node held when asked.
+	listLate atomic.Int64
+	// pushLate, when set, delays storing every version pushed to this node.
+	pushLate atomic.Int64
 	// turnedAway counts the version pushes refused while cut off, so a test
 	// can wait for a coordinator's background push to have really failed.
 	turnedAway atomic.Int32
@@ -129,6 +135,22 @@ func replicatedWith(t *testing.T, count, n, r, w int, tweak func(*Config)) []*rn
 				}
 				http.Error(rw, "frozen", http.StatusServiceUnavailable)
 				return
+			}
+			if late := time.Duration(nd.listLate.Load()); late > 0 && req.Method == http.MethodGet &&
+				strings.HasPrefix(req.URL.Path, "/internal/versions/") && req.URL.Query().Get("version") == "" {
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, req)
+				time.Sleep(late)
+				for k, vs := range rec.Header() {
+					rw.Header()[k] = vs
+				}
+				rw.WriteHeader(rec.Code)
+				rw.Write(rec.Body.Bytes())
+				return
+			}
+			if late := time.Duration(nd.pushLate.Load()); late > 0 && req.Method == http.MethodPut &&
+				strings.HasPrefix(req.URL.Path, "/internal/versions/") {
+				time.Sleep(late)
 			}
 			if nd.cut.Load() {
 				if req.Method == http.MethodPut && strings.HasPrefix(req.URL.Path, "/internal/versions/") {
@@ -665,5 +687,35 @@ func TestHintsFullIsReportedAtMostOnceAMinute(t *testing.T) {
 	h.hintNotRecorded("n2", "k", errors.New("disk on fire"))
 	if n := strings.Count(buf.String(), "could not record hint"); n != 2 {
 		t.Fatalf("other failures should be reported every time; got %d of 2", n)
+	}
+}
+
+// A create-only PUT checks a quorum for a live value, then writes. A write
+// that lands on the coordinator in between must not be silently replaced by
+// it: here the check's listings are taken before the other write and arrive
+// after it, and the create-only PUT must answer 412, leaving the other
+// write in place — not 201, with the other write gone.
+func TestCreateOnlyNeverReplacesAWriteItDidNotSee(t *testing.T) {
+	nodes := replicated(t, 5, 3, 3, 2)
+	reps := replicasOf(t, nodes, "k", 3)
+	reps[1].listLate.Store(int64(300 * time.Millisecond))
+	reps[2].listLate.Store(int64(300 * time.Millisecond))
+
+	created := make(chan int, 1)
+	go func() {
+		code, _, _ := req(t, http.MethodPut, reps[0].url("k"), "created", map[string]string{"If-None-Match": "*"})
+		created <- code
+	}()
+	time.Sleep(100 * time.Millisecond) // the create-only PUT's listings are taken, and on their way
+	// A write that has seen nothing, so it needs no quorum read: stored at
+	// once, while the create-only PUT waits for its listings.
+	code, _, hdr := req(t, http.MethodPut, reps[0].url("k"), "other", map[string]string{ContextHeader: ""})
+	mustBe(t, "the other write", code, http.StatusCreated)
+
+	if code := <-created; code != http.StatusPreconditionFailed {
+		t.Fatalf("create-only PUT: %d; want 412, a live value exists", code)
+	}
+	if !holds(t, reps[0], "k", hdr.Get(VersionHeader)) {
+		t.Fatalf("the acknowledged write %s was replaced by a create-only PUT that never saw it", hdr.Get(VersionHeader))
 	}
 }

@@ -2,12 +2,16 @@ package antientropy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -23,6 +27,7 @@ var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 type aeNode struct {
 	id     string
+	dir    string // the store's
 	store  *store.Store
 	srv    *httptest.Server
 	syncer *Syncer
@@ -35,11 +40,12 @@ func startNodes(t *testing.T, n int, ids ...string) map[string]*aeNode {
 	nodes := map[string]*aeNode{}
 	addrs := map[string]string{}
 	for _, id := range ids {
-		s, err := store.Open(t.TempDir())
+		dir := t.TempDir()
+		s, err := store.Open(dir)
 		if err != nil {
 			t.Fatal(err)
 		}
-		nd := &aeNode{id: id, store: s, srv: httptest.NewUnstartedServer(nil)}
+		nd := &aeNode{id: id, dir: dir, store: s, srv: httptest.NewUnstartedServer(nil)}
 		addrs[id] = nd.srv.Listener.Addr().String()
 		nodes[id] = nd
 	}
@@ -273,5 +279,32 @@ func TestRunRepairsOnItsOwn(t *testing.T) {
 			t.Fatal("the loop didn't repair the difference within 3s")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A key this node can't read is left out of its exchanges, and every other
+// key is still compared and repaired: one damaged file mustn't stop
+// anti-entropy for the whole node.
+func TestADamagedKeyDoesNotStopAnExchange(t *testing.T) {
+	nodes := startNodes(t, 2, "a", "b")
+	a, b := nodes["a"].store, nodes["b"].store
+	store1(t, a, "only-a", meta("w.1", 1), "from a")
+	store1(t, b, "only-b", meta("w.2", 1), "from b")
+	bad := meta("x.1", 1)
+	store1(t, a, "bad", bad, "x")
+	store1(t, b, "bad", bad, "x")
+	name := func(s string) string { sum := sha256.Sum256([]byte(s)); return hex.EncodeToString(sum[:]) }
+	f, err := os.OpenFile(filepath.Join(nodes["a"].dir, "objects", name("bad"), name(bad.Version.Dot.String())), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteAt([]byte("XXXX"), 0)
+	f.Close()
+
+	if _, err := nodes["a"].syncer.SyncWith(context.Background(), "b"); err != nil {
+		t.Fatalf("exchange with a damaged key here: %v", err)
+	}
+	if !slices.Equal(dotsOf(t, b, "only-a"), []string{"w.1:1"}) || !slices.Equal(dotsOf(t, a, "only-b"), []string{"w.2:1"}) {
+		t.Fatalf("after the exchange: only-a on b %v, only-b on a %v", dotsOf(t, b, "only-a"), dotsOf(t, a, "only-b"))
 	}
 }

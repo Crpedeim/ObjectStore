@@ -12,6 +12,7 @@ package antientropy
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"slices"
 	"strings"
 
@@ -124,15 +125,22 @@ func children(nodes []int) []int {
 
 // Shared returns the entries for every key this node holds whose replicas,
 // in view v, include both this node and peer: the keys the two of them
-// should agree on.
+// should agree on. A key that can't be read here is left out, so the rest
+// are still compared, and reported: the error then wraps store.ErrCorrupt,
+// and the entries are the rest.
 func Shared(st *store.Store, v *cluster.View, n int, peer string) ([]Entry, error) {
 	var out []Entry
+	var damaged []error
 	err := st.Walk(func(key string) error {
 		reps := v.PreferenceList(key, n)
 		if !slices.Contains(reps, v.Self()) || !slices.Contains(reps, peer) {
 			return nil
 		}
 		sibs, err := st.Siblings(key)
+		if errors.Is(err, store.ErrCorrupt) {
+			damaged = append(damaged, err)
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -146,5 +154,8 @@ func Shared(st *store.Store, v *cluster.View, n int, peer string) ([]Entry, erro
 		out = append(out, Entry{Key: key, Context: version.ContextOf(vs).String()})
 		return nil
 	})
-	return out, err
+	if err != nil && !errors.Is(err, store.ErrCorrupt) {
+		return nil, err
+	}
+	return out, errors.Join(err, errors.Join(damaged...))
 }
