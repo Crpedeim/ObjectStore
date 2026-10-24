@@ -21,9 +21,56 @@ binaries through crashes and freezes, and checks afterwards that nothing it was 
 - **306 tests**, all run under Go's race detector. Each feature was also checked by deliberately
   breaking it and confirming a test fails.
 
+## Videos
+
+### 1. Demo: the store working, and surviving failures
+
+DEMO_VIDEO_URL
+
+A five-node cluster on one machine, driven with `objctl`, the command-line client:
+
+- **Reads and writes.** A key is written once and lands on exactly three of the five nodes, its
+  replicas, which each node's own disk confirms.
+- **A crash.** The node coordinating the key is killed with `SIGKILL`. Reads and writes carry on
+  through the other replicas; gossip marks the node down; when it comes back, the write it missed is
+  already waiting for it, delivered by hinted handoff.
+- **Concurrent writes.** Two writes made from the same starting point are both kept, as siblings,
+  instead of one silently overwriting the other. Each can be read, and one write that has seen both
+  merges them.
+- **A create-only write.** `If-None-Match: *` on a key that exists answers 412 and changes nothing.
+- **Strict quorums.** With two of a key's three replicas dead, writes refuse (503) rather than
+  pretend to succeed.
+- **Sloppy quorums.** Restarted with `--sloppy`, the same writes succeed: other nodes stand in for
+  the dead replicas, even when all three are dead. When the replicas return, the stand-ins hand the
+  data back and drop their copies.
+- **The chaos harness.** Real node processes are crashed and frozen at random under load, strict
+  and sloppy. Afterwards it checks every acknowledged write: none lost, and the fabricated write it
+  plants is caught, proving the check can fail.
+
+### 2. Benchmarks: what it costs, and what failures cost
+
+BENCH_VIDEO_URL
+
+- **The test suite**, all 306 tests, run under Go's race detector.
+- **Per-operation cost.** One client, then sixteen, and how latency and throughput change; then how
+  much each extra replica a read or write waits for (R and W) costs, summarised in one table.
+- **A coordinator crash under load.** A node is killed mid-run while four clients read and write. The
+  second-by-second timeline shows the requests in flight at that instant fail (one or two) and
+  nothing after: the next replica takes over at once. Before replica fallback, the same crash failed
+  592 requests.
+- **Two nodes down, strict against sloppy.** Strict quorums fail about 30% of requests for as long as
+  the nodes are down, about 3,000 in all; sloppy quorums fail none.
+- **Anti-entropy.** With hints turned off, the chaos harness leaves hundreds of acknowledged writes on
+  too few replicas when anti-entropy is off too, and none when it's on.
+- **The Merkle tree's efficiency.** One differing key among 10,000 found in 5 requests, using 0.9% of
+  the bytes of a full listing; and how evenly the ring spreads keys over nodes.
+
+The numbers are from one machine running every node, so they show relative costs, not what a real
+cluster would do; [docs/benchmarks/RESULTS.md](docs/benchmarks/RESULTS.md) has the method.
+
 ---
 
-**Contents:** [Quick start](#quick-start) · [Architecture](#architecture) ·
+**Contents:** [Videos](#videos) · [Quick start](#quick-start) · [Architecture](#architecture) ·
 [Design decisions](#design-decisions-and-their-trade-offs) · [Testing](#testing) ·
 [Benchmarks](#benchmarks) · [HTTP API](#http-api) · [Configuration](#configuration) ·
 [Repository layout](#repository-layout) · [Limitations](#limitations-and-future-work) ·
