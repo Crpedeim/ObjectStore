@@ -82,7 +82,9 @@ start_lb() {
 	echo $! >"$DATA/lb.pid"
 	for _ in $(seq 1 50); do
 		running lb || break
-		if curl -sf "http://127.0.0.1:$HTTP_BASE/healthz" >/dev/null; then
+		# Our nodes answer "ok <id>". Anything else on the port is some other
+		# program's, and our balancer couldn't bind it.
+		if [[ $(curl -sf "http://127.0.0.1:$HTTP_BASE/healthz") == ok* ]] && running lb; then
 			echo "  load balancer up: :$HTTP_BASE, in front of $(ids | wc -l) nodes"
 			return 0
 		fi
@@ -144,6 +146,28 @@ wait_converged() {
 	return 1
 }
 
+# port_free reports whether nothing is listening on 127.0.0.1:PORT.
+port_free() { # port
+	! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+# check_ports refuses to go on if another program holds a port the cluster
+# needs: the balancer's, and each node's HTTP and gossip ports. Otherwise
+# that program would answer in our place, and its errors look like ours.
+check_ports() { # id...
+	local id p busy=()
+	port_free "$HTTP_BASE" || busy+=("$HTTP_BASE (load balancer)")
+	for id in "$@"; do
+		for p in "$(http_port "$id")" "$(gossip_port "$id")"; do
+			port_free "$p" || busy+=("$p ($id)")
+		done
+	done
+	((${#busy[@]} == 0)) && return 0
+	echo "cluster: these ports are in use by another program: ${busy[*]}" >&2
+	echo "cluster: find it with: ss -ltnp | grep -E ':(${HTTP_BASE}|808[1-9]|794[1-9])\b' — stop it, then start again" >&2
+	exit 1
+}
+
 # running reports whether node ID's process exists and is not a zombie.
 # `kill -0` alone is not enough: a killed process stays a zombie until its
 # parent collects its exit status, and kill -0 reports zombies as alive.
@@ -191,6 +215,8 @@ start)
 		done
 	fi
 	running lb && die "the load balancer is already running; run '$0 stop' first"
+	# shellcheck disable=SC2046 # one word per node ID
+	check_ports $(seq -f 'n%g' 1 "$n")
 	mkdir -p bin "$DATA"
 	go build -o "$BIN" ./cmd/node
 	go build -o bin/objctl ./cmd/objctl
