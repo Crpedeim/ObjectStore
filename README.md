@@ -25,7 +25,9 @@ binaries through crashes and freezes, and checks afterwards that nothing it was 
 
 ### 1. Demo: the store working, and surviving failures
 
-DEMO_VIDEO_URL
+[![objstore demo: the store working, and surviving failures](https://img.youtube.com/vi/ZPLo1zQqPng/hqdefault.jpg)](https://youtu.be/ZPLo1zQqPng)
+
+▶ [Watch on YouTube](https://youtu.be/ZPLo1zQqPng)
 
 A five-node cluster on one machine, driven with `objctl`, the command-line client:
 
@@ -49,7 +51,9 @@ A five-node cluster on one machine, driven with `objctl`, the command-line clien
 
 ### 2. Benchmarks: what it costs, and what failures cost
 
-BENCH_VIDEO_URL
+[![objstore benchmarks: what it costs, and what failures cost](https://img.youtube.com/vi/CtgLGwslu1g/hqdefault.jpg)](https://youtu.be/CtgLGwslu1g)
+
+▶ [Watch on YouTube](https://youtu.be/CtgLGwslu1g)
 
 - **The test suite**, all 306 tests, run under Go's race detector.
 - **Per-operation cost.** One client, then sixteen, and how latency and throughput change; then how
