@@ -111,7 +111,9 @@ func (s *Syncer) SyncWith(ctx context.Context, peer string) (Stats, error) {
 		return st, fmt.Errorf("anti-entropy: no peer %q", peer)
 	}
 	entries, err := Shared(s.cfg.Store, v, s.cfg.N, peer)
-	if err != nil {
+	if errors.Is(err, store.ErrCorrupt) {
+		s.cfg.Log.Warn("anti-entropy: keys that can't be read are left out", "peer", peer, "err", err)
+	} else if err != nil {
 		return st, err
 	}
 	if b, err := json.Marshal(entries); err == nil {
@@ -151,7 +153,14 @@ func (s *Syncer) SyncWith(ctx context.Context, peer string) (Stats, error) {
 		}
 		for _, key := range differing(mine.buckets[leaf], theirs) {
 			st.KeysDiffering++
-			if err := s.repair(ctx, addr, key, &st); err != nil {
+			err := s.repair(ctx, addr, key, &st)
+			if errors.Is(err, store.ErrCorrupt) {
+				// It can't be read here, so it can't be compared here. The
+				// peer's own exchanges with this node skip it the same way.
+				s.cfg.Log.Warn("anti-entropy: can't repair a key that can't be read", "key", key, "err", err)
+				continue
+			}
+			if err != nil {
 				return st, fmt.Errorf("anti-entropy: repairing %q with %s: %w", key, peer, err)
 			}
 		}

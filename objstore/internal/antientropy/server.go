@@ -3,6 +3,7 @@ package antientropy
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -61,7 +62,9 @@ func (s *Server) treeFor(peer string) (*Tree, error) {
 		return c.tree, nil
 	}
 	entries, err := Shared(s.store, s.view.Load(), s.n, peer)
-	if err != nil {
+	if errors.Is(err, store.ErrCorrupt) {
+		s.log.Warn("anti-entropy: keys that can't be read are left out of the tree", "peer", peer, "err", err)
+	} else if err != nil {
 		return nil, err
 	}
 	t := NewTree(entries)

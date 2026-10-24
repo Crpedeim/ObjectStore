@@ -15,13 +15,26 @@ cd "$(dirname "$0")/.."
 [[ $# -ge 3 ]] || { sed -n '2,/^set -euo/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 2; }
 label=$1 cluster=$2 load=$3 repeats=${4:-3}
 results=${RESULTS:-bench-results.jsonl}
+# Every run starts by deleting data/. A cluster running on it would lose its
+# data, and its nodes would keep the ports the new cluster needs.
+status=$( [[ -f data/nodes ]] && scripts/cluster.sh status 2>/dev/null || true)
+if [[ $status == *" running "* ]]; then
+	echo "bench: a cluster is running on data/, which each run deletes; stop it first: scripts/cluster.sh stop" >&2
+	exit 1
+fi
 go build -o bin/objbench ./cmd/objbench
 trap 'scripts/cluster.sh stop >/dev/null 2>&1 || true' EXIT
 for i in $(seq 1 "$repeats"); do
 	rm -rf data
 	# shellcheck disable=SC2086 # the options are meant to split into words
 	scripts/cluster.sh start $cluster >/dev/null
+	# Through the balancer, wherever --port put it, unless the options say -addr.
+	addr=()
+	if [[ " $load " != *" -addr "* ]]; then
+		lb_port=$(sed -n 's/^PORT=//p' data/config)
+		addr=(-addr "127.0.0.1:${lb_port:-8080}")
+	fi
 	# shellcheck disable=SC2086
-	bin/objbench $load -label "$label" -json "$results" | sed -n 2p | sed "s/^/$label, run $i:/"
+	bin/objbench $load "${addr[@]}" -label "$label" -json "$results" | sed -n 2p | sed "s/^/$label, run $i:/"
 	scripts/cluster.sh stop >/dev/null
 done

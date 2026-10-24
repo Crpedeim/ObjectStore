@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -1316,5 +1320,58 @@ func TestHintsForADownNodeExpire(t *testing.T) {
 	newDispatcher(local, rc.view("r2"), hints, DispatcherConfig{Window: time.Hour}).DrainOnce(context.Background())
 	if got := keysOf(must(hints.Pending("r2"))); !slices.Equal(got, keys[1:]) {
 		t.Fatalf("r2 is down and has hints %v; want only the recent one, %v", got, keys[1:])
+	}
+}
+
+// damage overwrites the start of key's version file d in the store at root,
+// so it no longer reads as one.
+func damage(t *testing.T, root, key string, d version.Dot) {
+	t.Helper()
+	name := func(s string) string { sum := sha256.Sum256([]byte(s)); return hex.EncodeToString(sum[:]) }
+	f, err := os.OpenFile(filepath.Join(root, "objects", name(key), name(d.String())), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt([]byte("XXXX"), 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A key that can't be read here stays here, reported, and every other key
+// still moves: one damaged file mustn't stop handoff for the whole node.
+func TestPassMovesEveryKeyPastADamagedOne(t *testing.T) {
+	root := t.TempDir()
+	local, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := openStore(t)
+	srv := ownerServer(t, remote)
+	v := twoNodeView(t, srv.Listener.Addr().String())
+	theirs := keysOwnedBy(v, "owner", 10)
+	var bad store.Meta
+	for i, k := range theirs {
+		m := put(t, local, k, "value-"+k)
+		if i == 4 {
+			bad = m
+		}
+	}
+	damage(t, root, theirs[4], bad.Version.Dot)
+
+	st, err := newHandoff(local, v, Config{}).Pass(context.Background())
+	if !errors.Is(err, store.ErrCorrupt) {
+		t.Fatalf("pass returned %v; want the damaged key reported", err)
+	}
+	if st.Moved != 9 {
+		t.Fatalf("stats %+v; want the 9 readable keys moved", st)
+	}
+	for i, k := range theirs {
+		if i == 4 {
+			continue
+		}
+		if got, ok := value(t, remote, k); !ok || got != "value-"+k {
+			t.Fatalf("%s on owner = %q, %v", k, got, ok)
+		}
 	}
 }

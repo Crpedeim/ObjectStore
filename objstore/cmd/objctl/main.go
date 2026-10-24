@@ -203,7 +203,11 @@ func runLB(ctx context.Context, args []string) {
 	b := lb.New(strings.Split(*backends, ","), log)
 	go b.Run(ctx, *every)
 	srv := &http.Server{Addr: *listen, Handler: b, ReadHeaderTimeout: 10 * time.Second}
+	// ListenAndServe returns as soon as Shutdown begins, so wait for it to
+	// finish the requests in flight before exiting.
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -213,4 +217,5 @@ func runLB(ctx context.Context, args []string) {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fail(err, false)
 	}
+	<-drained
 }

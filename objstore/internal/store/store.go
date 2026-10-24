@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Crpedeim/objstore/internal/fsutil"
 	"github.com/Crpedeim/objstore/internal/version"
@@ -43,6 +44,10 @@ var ErrEmptyKey = errors.New("store: empty key")
 
 // ErrKeyTooLong is returned for keys longer than MaxKeyLen.
 var ErrKeyTooLong = errors.New("store: key too long")
+
+// ErrVersionTooLarge is returned by Write for a version whose dot or past
+// is longer than a version file may hold.
+var ErrVersionTooLarge = errors.New("store: version too large")
 
 // ErrCorrupt is returned when a version file's header is damaged, or names a
 // different key or dot than the file's location says it should.
@@ -101,10 +106,15 @@ type Store struct {
 	// locks serialises Write and Remove per key. 64 stripes: unrelated keys
 	// rarely wait on each other, and memory stays fixed however many keys
 	// there are.
-	locks [64]sync.Mutex
+	locks [stripes]sync.Mutex
+	// changes counts, per stripe, the changes to a key's directory: odd
+	// while one is under way. A reader that takes no lock trusts its
+	// listing only if the count was even and the same before and after.
+	changes [stripes]atomic.Uint64
 
 	epochMu sync.Mutex
 	epoch   atomic.Uint64
+	fresh   bool // Open found no epoch: this data directory has never been used
 }
 
 // Open prepares the directory layout, removes temp files left by a crash,
@@ -194,6 +204,7 @@ func (s *Store) writeFileAtomic(dir, name, content string) error {
 func (s *Store) loadEpoch() error {
 	b, err := os.ReadFile(filepath.Join(s.root, epochFile))
 	if errors.Is(err, fs.ErrNotExist) {
+		s.fresh = true
 		return nil
 	}
 	if err != nil {
@@ -210,6 +221,26 @@ func (s *Store) loadEpoch() error {
 // Epoch is the current epoch. A coordinator names itself node.epoch, so
 // counters it issued in an earlier epoch can never be issued again.
 func (s *Store) Epoch() uint64 { return s.epoch.Load() }
+
+// Fresh reports whether Open found a data directory that had never been
+// used. Its epochs start from 1, so if the node had a store before, under
+// the same name, it must move them past the old store's: see EpochAtLeast.
+func (s *Store) Fresh() bool { return s.fresh }
+
+// EpochAtLeast moves the epoch to n, durably, if it is lower, and returns
+// the epoch.
+func (s *Store) EpochAtLeast(n uint64) (uint64, error) {
+	s.epochMu.Lock()
+	defer s.epochMu.Unlock()
+	if cur := s.epoch.Load(); cur >= n {
+		return cur, nil
+	}
+	if err := s.writeFileAtomic(s.root, epochFile, strconv.FormatUint(n, 10)+"\n"); err != nil {
+		return 0, err
+	}
+	s.epoch.Store(n)
+	return n, nil
+}
 
 // NewEpoch starts a new epoch, durably, before returning it. Call it before
 // deleting versions this node may have coordinated: after the delete this
@@ -254,10 +285,23 @@ func (s *Store) versionPath(key string, d version.Dot) string {
 	return filepath.Join(s.keyDir(key), nameFor(d.String()))
 }
 
-func (s *Store) lockFor(key string) *sync.Mutex {
+// stripes is how many locks, and change counts, keys share.
+const stripes = 64
+
+func stripe(key string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(key))
-	return &s.locks[h.Sum32()%uint32(len(s.locks))]
+	return h.Sum32() % stripes
+}
+
+func (s *Store) lockFor(key string) *sync.Mutex { return &s.locks[stripe(key)] }
+
+// changing marks key's directory as changing, until the function it returns
+// is called. Call it holding the key's lock.
+func (s *Store) changing(key string) (done func()) {
+	c := &s.changes[stripe(key)]
+	c.Add(1)
+	return func() { c.Add(1) }
 }
 
 func appendString(b []byte, s string) []byte {
@@ -414,13 +458,41 @@ func resolve(ms []Meta) []Meta {
 // stored version that no other stored version replaces, ordered by dot. A
 // key with nothing stored returns none and no error.
 //
-// It takes no lock. A Write publishes a complete file before removing what
-// it replaces, so a reader that catches the moment in between sees both,
-// and resolving drops the replaced one.
+// It usually takes no lock, and a reader that lists the key's directory
+// while a Write replaces a version can't trust what it sees: it may list the
+// directory before the new file is linked and open the old one after it is
+// removed, or a directory changing under it may list neither. Either way
+// the key would read as empty. So a listing is kept only if no change to the
+// key began or ended while it was taken; otherwise it is taken again, after
+// a pause that doubles each time. A change lasts from a link to the last
+// removal, a directory fsync or two, and the stripe's writers take turns, so
+// a quiet moment comes quickly. Only a stripe that never keeps still through
+// all the attempts is read under its lock — which may then wait for a whole
+// write of another key in the stripe, value and all.
 func (s *Store) Siblings(key string) ([]Meta, error) {
 	if key == "" {
 		return nil, ErrEmptyKey
 	}
+	c := &s.changes[stripe(key)]
+	for attempt := 0; attempt < 8; attempt++ {
+		if attempt > 0 {
+			time.Sleep(50 * time.Microsecond << attempt) // 100µs, doubling to 6.4ms
+		}
+		before := c.Load()
+		if before%2 == 1 {
+			continue // a change is under way
+		}
+		all, err := s.readAll(key)
+		if err != nil {
+			return nil, err
+		}
+		if c.Load() == before {
+			return resolve(all), nil
+		}
+	}
+	mu := s.lockFor(key)
+	mu.Lock()
+	defer mu.Unlock()
 	all, err := s.readAll(key)
 	if err != nil {
 		return nil, err
@@ -475,7 +547,8 @@ type Plan func(siblings []Meta) (Meta, bool)
 // replaces is removed.
 //
 // Write holds the key's lock for its whole duration — including while the
-// value streams in — so other writers of the same key wait. Readers never do.
+// value streams in — so other writers of the same key wait. Readers almost
+// never do: see Siblings.
 func (s *Store) Write(key string, plan Plan, r io.Reader) (m Meta, stored bool, err error) {
 	if key == "" {
 		return Meta{}, false, ErrEmptyKey
@@ -497,6 +570,11 @@ func (s *Store) Write(key string, plan Plan, r io.Reader) (m Meta, stored bool, 
 	}
 	if err := m.Version.Valid(); err != nil {
 		return Meta{}, false, fmt.Errorf("store: plan for %q: %w", key, err)
+	}
+	// What readHeader would refuse as corrupt must never be written: one
+	// such file makes every later read and write of the key fail.
+	if len(m.Version.Dot.String()) > maxDotLen || len(m.Version.Past.String()) > version.MaxEncodedLen {
+		return Meta{}, false, fmt.Errorf("%w: version %v of %q is too large to store", ErrVersionTooLarge, m.Version.Dot, key)
 	}
 	for _, have := range all {
 		if have.Version.Dot == m.Version.Dot || have.Version.Obsoletes(m.Version) {
@@ -546,6 +624,8 @@ func (s *Store) Write(key string, plan Plan, r io.Reader) (m Meta, stored bool, 
 			return Meta{}, false, err
 		}
 	}
+	// From the link to the last removal, the key's directory is changing.
+	defer s.changing(key)()
 	// link publishes the complete file under its final name. Each version
 	// has a distinct name, so link — which never overwrites — is enough.
 	if err = os.Link(tmpName, s.versionPath(key, m.Version.Dot)); err != nil {
@@ -590,6 +670,7 @@ func (s *Store) Remove(key string, dots []version.Dot) error {
 	mu := s.lockFor(key)
 	mu.Lock()
 	defer mu.Unlock()
+	defer s.changing(key)()
 	dir := s.keyDir(key)
 	for _, d := range dots {
 		if err := os.Remove(s.versionPath(key, d)); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -613,14 +694,24 @@ var errNoVersions = errors.New("store: no versions")
 // Walk calls fn with every key that has at least one version stored, until
 // fn returns an error. Keys removed during the walk are skipped; keys
 // written during it may or may not be seen. fn may Write and Remove freely.
+//
+// A key whose directory can't be read as that key's — a damaged version
+// file — is skipped too, so that one bad file doesn't stop the walk: handoff
+// and anti-entropy walk the whole store. Once every other key has been
+// visited, Walk returns an error for each one skipped, wrapping ErrCorrupt.
 func (s *Store) Walk(fn func(key string) error) error {
 	entries, err := os.ReadDir(s.objects)
 	if err != nil {
 		return fmt.Errorf("store: read objects: %w", err)
 	}
+	var damaged []error
 	for _, e := range entries {
 		key, err := s.keyOfDir(e.Name())
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, errNoVersions) {
+			continue
+		}
+		if errors.Is(err, ErrCorrupt) {
+			damaged = append(damaged, err)
 			continue
 		}
 		if err != nil {
@@ -630,7 +721,7 @@ func (s *Store) Walk(fn func(key string) error) error {
 			return err
 		}
 	}
-	return nil
+	return errors.Join(damaged...)
 }
 
 // keyOfDir reads the key from the first readable version file in an object

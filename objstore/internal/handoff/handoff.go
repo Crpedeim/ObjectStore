@@ -24,6 +24,7 @@ package handoff
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -127,6 +128,9 @@ func (h *Handoff) Pass(ctx context.Context) (Stats, error) {
 	// A replica that fails once is skipped for the rest of the pass, so an
 	// unreachable node costs one timeout per pass, not one per key.
 	failed := map[string]bool{}
+	// A key that can't be read here is left here, and reported once the
+	// pass is over; it mustn't keep every other key from moving.
+	var damaged []error
 	err := h.cfg.Store.Walk(func(key string) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -137,6 +141,10 @@ func (h *Handoff) Pass(ctx context.Context) (Stats, error) {
 			return nil
 		}
 		sibs, err := h.cfg.Store.Siblings(key)
+		if errors.Is(err, store.ErrCorrupt) {
+			damaged = append(damaged, err)
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -181,7 +189,10 @@ func (h *Handoff) Pass(ctx context.Context) (Stats, error) {
 		st.Moved++
 		return nil
 	})
-	return st, err
+	if err != nil && !errors.Is(err, store.ErrCorrupt) {
+		return st, err // the pass stopped short
+	}
+	return st, errors.Join(err, errors.Join(damaged...))
 }
 
 // Run sweeps whenever membership changes and every Interval, until ctx ends.
@@ -198,7 +209,10 @@ func (h *Handoff) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil {
+		switch {
+		case errors.Is(err, store.ErrCorrupt):
+			h.cfg.Log.Warn("handoff pass: keys that can't be read were left here", "err", err)
+		case err != nil:
 			h.cfg.Log.Error("handoff pass failed", "err", err)
 		}
 		if st.Moved+st.Waiting > 0 {

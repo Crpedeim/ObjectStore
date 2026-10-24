@@ -88,8 +88,13 @@ func TestHintsIgnoreDamage(t *testing.T) {
 	if !slices.Equal(keysOf(pending), []string{"good"}) {
 		t.Fatalf("pending %q; want only the intact hint", keysOf(pending))
 	}
+	// A temp file may be a Record in progress, so reading leaves it alone;
+	// reopening, as a restart after the crash does, removes it.
+	if _, err := OpenHints(h.dir, 0); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(filepath.Join(d, keyFile("good")+".tmp-123")); !os.IsNotExist(err) {
-		t.Fatal("left the crash leftover behind")
+		t.Fatal("reopening left the crash leftover behind")
 	}
 	if targets, _ := h.Targets(); !slices.Equal(targets, []string{"n2"}) {
 		t.Fatalf("targets %q", targets)
@@ -194,4 +199,37 @@ func must(hs []Hint, err error) []Hint {
 		panic(err)
 	}
 	return hs
+}
+
+// The dispatcher reads a replica's hints while writes may be recording new
+// ones for it. Reading must never disturb a recording: a temp file belongs to
+// a Record in progress until it is renamed into place, so removing it as
+// crash debris would make that Record fail, and the hint would be lost.
+func TestRecordingWhileHintsAreReadLosesNothing(t *testing.T) {
+	h := openHints(t)
+	stop := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := h.Pending("n2"); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	defer func() { close(stop); <-readerDone }()
+	for i := 0; i < 300; i++ {
+		if err := h.Record("n2", fmt.Sprintf("k%d", i)); err != nil {
+			t.Fatalf("recording hint %d while the replica's hints were being read: %v", i, err)
+		}
+	}
+	if got := len(must(h.Pending("n2"))); got != 300 {
+		t.Fatalf("%d hints pending; want all 300", got)
+	}
 }

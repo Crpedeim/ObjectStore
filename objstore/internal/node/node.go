@@ -56,7 +56,11 @@ type Config struct {
 	// limit. Past either, anti-entropy repairs what hints would have.
 	HintWindow time.Duration
 	MaxHints   int
-	Log        *slog.Logger
+	// Sloppy turns on sloppy quorums: when a key's replicas can't be reached,
+	// the next nodes past them on the ring stand in, and hand their copies
+	// back once the replicas return.
+	Sloppy bool
+	Log    *slog.Logger
 
 	// HandoffInterval is how often handoff sweeps between membership
 	// changes; zero means handoff.DefaultInterval.
@@ -128,6 +132,21 @@ func Start(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	if st.Fresh() && g.KnownBefore() {
+		// This node lost its disk and came back under its old name. Its
+		// epochs started again from 1, so its writes would reuse the names
+		// its old self gave writes the other replicas still hold, and they
+		// would drop the new ones as duplicates. Move past every epoch the
+		// old store can have used: one epoch costs at least a couple of
+		// fsyncs, so it has used fewer than one a millisecond.
+		epoch, err := st.EpochAtLeast(uint64(time.Now().UnixMilli()))
+		if err != nil {
+			g.Shutdown()
+			return nil, err
+		}
+		cfg.Log.Warn("this node's data directory is new, but the cluster knew a node by its name: "+
+			"starting its epochs afresh", "epoch", epoch)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /cluster/members", g.MembersHandler())
@@ -149,10 +168,11 @@ func Start(cfg Config) (*Node, error) {
 		View: g.Holder(),
 		Local: api.Handler(api.Config{
 			Store: st, NodeID: cfg.ID, Log: cfg.Log,
-			View: g.Holder(), N: cfg.N, R: cfg.R, W: cfg.W, Peers: peers, Hints: hinter,
+			View: g.Holder(), N: cfg.N, R: cfg.R, W: cfg.W, Peers: peers, Hints: hinter, Sloppy: cfg.Sloppy,
 		}),
 		Client: httpClient,
 		N:      cfg.N,
+		Sloppy: cfg.Sloppy,
 		Log:    cfg.Log,
 	}))
 
@@ -189,7 +209,7 @@ func Start(cfg Config) (*Node, error) {
 		}
 		go func() { loops.Wait(); close(n.stopped) }()
 	}
-	cfg.Log.Info("node started", "http", adv, "gossip", g.Addr(), "join", cfg.Join, "n", cfg.N, "r", cfg.R, "w", cfg.W)
+	cfg.Log.Info("node started", "http", adv, "gossip", g.Addr(), "join", cfg.Join, "n", cfg.N, "r", cfg.R, "w", cfg.W, "sloppy", cfg.Sloppy)
 	return n, nil
 }
 

@@ -352,6 +352,25 @@ func TestUnreadableMembersFileRefusesToStart(t *testing.T) {
 	}
 }
 
+// Only a member list received while joining says whether the cluster knew
+// this node's name before: every later one names it as a matter of course.
+func TestKnownBeforeOnlyCountsListsReceivedWhileJoining(t *testing.T) {
+	g := &Gossip{log: discard, mem: newMembership("n1", "127.0.0.1:8081", 16)}
+	first, _ := g.mem.view()
+	g.holder = cluster.NewHolder(first)
+	list := []byte(`{"version":1,"members":{"n1":"127.0.0.1:8081","n2":"127.0.0.1:8082"}}`)
+
+	g.mergeRemote([]byte(`{"version":1,"members":{"n2":"127.0.0.1:8082"}}`), true)
+	g.mergeRemote(list, false)
+	if g.KnownBefore() {
+		t.Fatal("known before, from a list that didn't name it while joining")
+	}
+	g.mergeRemote(list, true)
+	if !g.KnownBefore() {
+		t.Fatal("not known before, from a list that named it while joining")
+	}
+}
+
 // A peer's member list is input from the network. Bad entries are skipped;
 // good ones in the same list still count.
 func TestMemberListFromPeerIsChecked(t *testing.T) {
@@ -359,10 +378,10 @@ func TestMemberListFromPeerIsChecked(t *testing.T) {
 	first, _ := g.mem.view()
 	g.holder = cluster.NewHolder(first)
 
-	g.mergeRemote([]byte("not json"))
-	g.mergeRemote([]byte(`{"version":7,"members":{"n5":"127.0.0.1:8085"}}`))
-	g.mergeRemote(append([]byte(`{"version":1,"members":{"n6":"`), bytes.Repeat([]byte("x"), maxMembersState)...))
-	g.mergeRemote([]byte(`{"version":1,"members":{"":"127.0.0.1:1","n2":"no-port","n3":"127.0.0.1:8083"}}`))
+	g.mergeRemote([]byte("not json"), false)
+	g.mergeRemote([]byte(`{"version":7,"members":{"n5":"127.0.0.1:8085"}}`), false)
+	g.mergeRemote(append([]byte(`{"version":1,"members":{"n6":"`), bytes.Repeat([]byte("x"), maxMembersState)...), false)
+	g.mergeRemote([]byte(`{"version":1,"members":{"":"127.0.0.1:1","n2":"no-port","n3":"127.0.0.1:8083"}}`), false)
 
 	v := g.holder.Load()
 	if !slices.Equal(v.Nodes(), []string{"n1", "n3"}) || !v.Down("n3") {

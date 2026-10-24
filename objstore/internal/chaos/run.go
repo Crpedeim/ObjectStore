@@ -32,6 +32,9 @@ type Config struct {
 	// hints, and how often replicas compare (zero turns it off).
 	Hints       bool
 	AntiEntropy time.Duration
+	// Sloppy is passed to every node: whether stand-ins take the place of
+	// unreachable replicas.
+	Sloppy bool
 	// Settle is the longest to wait, after healing, for every acknowledged
 	// write to reach all its replicas.
 	Settle time.Duration
@@ -59,6 +62,7 @@ type Report struct {
 	HintsDrainedIn      time.Duration // until no node held a hint
 	HintsLeft           int
 	ReplicasConvergedIn time.Duration // until every acknowledged write was on all its replicas; 0 if never
+	StandInsLeft        int           // keys some node outside their replicas still held when the check ran
 
 	Lost            []Ack // acknowledged writes no node holds or covers
 	Invisible       []Ack // acknowledged writes a quorum read doesn't reflect
@@ -122,7 +126,8 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 	}
 	args := []string{"-n", strconv.Itoa(cfg.N), "-r", strconv.Itoa(cfg.R), "-w", strconv.Itoa(cfg.W),
 		"-transfer-mb", strconv.Itoa(cfg.TransferMB),
-		"-hints=" + strconv.FormatBool(cfg.Hints), "-anti-entropy", cfg.AntiEntropy.String()}
+		"-hints=" + strconv.FormatBool(cfg.Hints), "-anti-entropy", cfg.AntiEntropy.String(),
+		"-sloppy=" + strconv.FormatBool(cfg.Sloppy)}
 	c, err := newCluster(cfg.Bin, cfg.Dir, cfg.Nodes, args)
 	if err != nil {
 		return nil, err
@@ -134,8 +139,8 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 	if err := c.converged(30 * time.Second); err != nil {
 		return nil, err
 	}
-	logf("%d nodes up, N=%d R=%d W=%d, hints %v, anti-entropy every %v; %v of traffic and faults",
-		cfg.Nodes, cfg.N, cfg.R, cfg.W, cfg.Hints, cfg.AntiEntropy, cfg.Duration)
+	logf("%d nodes up, N=%d R=%d W=%d, hints %v, anti-entropy every %v, sloppy %v; %v of traffic and faults",
+		cfg.Nodes, cfg.N, cfg.R, cfg.W, cfg.Hints, cfg.AntiEntropy, cfg.Sloppy, cfg.Duration)
 
 	keys := make([]string, cfg.Keys)
 	for i := range keys {
@@ -240,16 +245,16 @@ nemesis:
 				rep.HintsDrainedIn = time.Since(healStart)
 			}
 		}
-		if rep.ReplicasConvergedIn == 0 {
-			_, held, err := listings(c, keys)
-			if err != nil {
-				return rep, err
-			}
-			if len(UnderReplicated(h.acks, held)) == 0 {
-				rep.ReplicasConvergedIn = time.Since(healStart)
-			}
+		_, held, strays, err := listings(c, keys)
+		if err != nil {
+			return rep, err
 		}
-		if (rep.HintsDrainedIn > 0 && rep.ReplicasConvergedIn > 0) || time.Since(healStart) > cfg.Settle {
+		if rep.ReplicasConvergedIn == 0 && len(UnderReplicated(h.acks, held)) == 0 {
+			rep.ReplicasConvergedIn = time.Since(healStart)
+		}
+		// Stand-ins hand their copies back only once every replica has
+		// them, so waiting for that too checks the handback finishes.
+		if (rep.HintsDrainedIn > 0 && rep.ReplicasConvergedIn > 0 && strays == 0) || time.Since(healStart) > cfg.Settle {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -260,10 +265,11 @@ nemesis:
 	// The final check, with the canary planted.
 	rep.Duplicates = Duplicates(h.acks)
 	acks := append(append([]Ack(nil), h.acks...), Ack{Key: keys[0], Dot: canary, At: time.Now()})
-	anywhere, quorum, held, err := finalState(c, keys)
+	anywhere, quorum, held, strays, err := finalState(c, keys)
 	if err != nil {
 		return rep, err
 	}
+	rep.StandInsLeft = strays
 	rep.UnderReplicated = UnderReplicated(h.acks, held)
 	for _, a := range Lost(acks, anywhere) {
 		if a.Dot == canary {
@@ -343,38 +349,41 @@ func write(hc *http.Client, h *history, key, method, url, body string, success i
 
 // finalState returns, for every key: the context of everything any node
 // holds; the context a quorum read returns; and the context each of the
-// key's replicas holds itself.
-func finalState(c *cluster, keys []string) (anywhere, quorum map[string]version.Context, held map[string]map[string]version.Context, err error) {
-	anywhere, held, err = listings(c, keys)
+// key's replicas holds itself. And how many keys a node outside their
+// replicas still holds.
+func finalState(c *cluster, keys []string) (anywhere, quorum map[string]version.Context, held map[string]map[string]version.Context, strays int, err error) {
+	anywhere, held, strays, err = listings(c, keys)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, 0, err
 	}
 	hc := &http.Client{Timeout: 10 * time.Second}
 	quorum = map[string]version.Context{}
 	for _, key := range keys {
 		resp, err := hc.Get("http://" + c.nodes[0].http + "/objects/" + key)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("reading %s: %w", key, err)
+			return nil, nil, nil, 0, fmt.Errorf("reading %s: %w", key, err)
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusMultipleChoices && resp.StatusCode != http.StatusNotFound {
-			return nil, nil, nil, fmt.Errorf("reading %s after healing: status %d", key, resp.StatusCode)
+			return nil, nil, nil, 0, fmt.Errorf("reading %s after healing: status %d", key, resp.StatusCode)
 		}
 		ctx, err := version.ParseContext(resp.Header.Get(replica.ContextHeader))
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, 0, err
 		}
 		quorum[key] = ctx
 	}
-	return anywhere, quorum, held, nil
+	return anywhere, quorum, held, strays, nil
 }
 
 // listings reads every node's own copy of every key, through
 // /internal/versions, which neither asks another node nor repairs anything.
 // It returns, for every key, the context of everything any node holds, and
-// the context each of the key's replicas holds itself.
-func listings(c *cluster, keys []string) (anywhere map[string]version.Context, held map[string]map[string]version.Context, err error) {
+// the context each of the key's replicas holds itself; and how many keys
+// some node that isn't one of their replicas holds: a stand-in's copy, not
+// yet handed back.
+func listings(c *cluster, keys []string) (anywhere map[string]version.Context, held map[string]map[string]version.Context, strays int, err error) {
 	hc := &http.Client{Timeout: 10 * time.Second}
 	anywhere, held = map[string]version.Context{}, map[string]map[string]version.Context{}
 	for _, key := range keys {
@@ -383,42 +392,48 @@ func listings(c *cluster, keys []string) (anywhere map[string]version.Context, h
 		}
 		resp, err := hc.Get("http://" + c.nodes[0].http + "/cluster/owner/" + key)
 		if err != nil {
-			return nil, nil, fmt.Errorf("replicas of %s: %w", key, err)
+			return nil, nil, 0, fmt.Errorf("replicas of %s: %w", key, err)
 		}
 		err = json.NewDecoder(resp.Body).Decode(&owner)
 		resp.Body.Close()
 		if err != nil {
-			return nil, nil, fmt.Errorf("replicas of %s: %w", key, err)
+			return nil, nil, 0, fmt.Errorf("replicas of %s: %w", key, err)
 		}
 		held[key] = map[string]version.Context{}
 		var all []version.Version
+		stray := false
 		for _, p := range c.nodes {
 			resp, err := hc.Get("http://" + p.http + "/internal/versions/" + key)
 			if err != nil {
-				return nil, nil, fmt.Errorf("listing %s on %s: %w", key, p.id, err)
+				return nil, nil, 0, fmt.Errorf("listing %s on %s: %w", key, p.id, err)
 			}
 			var entries []replica.Entry
 			err = json.NewDecoder(resp.Body).Decode(&entries)
 			resp.Body.Close()
 			if err != nil {
-				return nil, nil, fmt.Errorf("listing %s on %s: %w", key, p.id, err)
+				return nil, nil, 0, fmt.Errorf("listing %s on %s: %w", key, p.id, err)
 			}
 			var mine []version.Version
 			for _, e := range entries {
 				m, err := e.Meta()
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, 0, err
 				}
 				mine = append(mine, m.Version)
 			}
 			all = append(all, mine...)
 			if slices.Contains(owner.PreferenceList, p.id) {
 				held[key][p.id] = version.ContextOf(mine)
+			} else if len(mine) > 0 {
+				stray = true
 			}
 		}
 		anywhere[key] = version.ContextOf(all)
+		if stray {
+			strays++
+		}
 	}
-	return anywhere, held, nil
+	return anywhere, held, strays, nil
 }
 
 func orNever(d time.Duration) string {

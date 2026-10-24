@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Crpedeim/objstore/internal/api"
 	"github.com/Crpedeim/objstore/internal/store"
@@ -272,4 +273,42 @@ func TestProxiedRequestsReuseConnections(t *testing.T) {
 		t.Fatalf("400 requests from 8 clients opened %d connections to the node; want about 8, at most 16", n)
 	}
 	t.Logf("400 requests from 8 clients: %d connections to the node", conns.Load())
+}
+
+// A frozen node accepts connections and never answers. A request sent to it
+// must not wait for it forever: a read goes to another node, and a write —
+// which may have arrived, so is never retried — fails.
+func TestFrozenNodeDoesNotHoldRequestsForever(t *testing.T) {
+	nodes, addrs := fakeNodes(t, 1)
+	release := make(chan struct{})
+	frozen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			return
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(frozen.Close)
+	t.Cleanup(func() { close(release) }) // runs first, so Close can finish
+	frozenAddr := strings.TrimPrefix(frozen.URL, "http://")
+
+	for _, tc := range []struct {
+		method string
+		want   int
+	}{{http.MethodGet, http.StatusOK}, {http.MethodPut, http.StatusBadGateway}} {
+		b := newBalancer(append([]string{frozenAddr}, addrs...), discard, 200*time.Millisecond)
+		b.next.Store(uint64(len(addrs))) // so the first pick is the frozen node
+		start := time.Now()
+		if code := send(t, b, tc.method); code != tc.want {
+			t.Fatalf("%s through a frozen node: %d; want %d", tc.method, code, tc.want)
+		}
+		if took := time.Since(start); took > 2*time.Second {
+			t.Fatalf("%s took %v: it waited for the frozen node", tc.method, took)
+		}
+	}
+	if nodes[0].hits.Load() != 1 {
+		t.Fatalf("the live node served %d requests; want the one read", nodes[0].hits.Load())
+	}
 }

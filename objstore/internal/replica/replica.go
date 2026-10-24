@@ -75,7 +75,7 @@ func (e Entry) Meta() (store.Meta, error) {
 // Client talks to other nodes' internal endpoints.
 type Client struct {
 	HTTP  *http.Client
-	Stall time.Duration // a transfer with no bytes moving for this long is abandoned
+	Stall time.Duration // a transfer with no bytes moving for this long is abandoned; zero means never
 }
 
 func (c *Client) path(addr, endpoint, key string) string {

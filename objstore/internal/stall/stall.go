@@ -28,8 +28,12 @@ type Guard struct {
 }
 
 // NewGuard starts a countdown that calls cancel(ErrStalled) unless Progress
-// or Pause is called first.
+// or Pause is called first. A timeout of zero or less makes a guard that
+// never fires.
 func NewGuard(timeout time.Duration, cancel context.CancelCauseFunc) *Guard {
+	if timeout <= 0 {
+		return &Guard{}
+	}
 	return &Guard{
 		timeout: timeout,
 		timer:   time.AfterFunc(timeout, func() { cancel(ErrStalled) }),
@@ -40,7 +44,9 @@ func NewGuard(timeout time.Duration, cancel context.CancelCauseFunc) *Guard {
 func (g *Guard) Progress() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.timer.Reset(g.timeout)
+	if g.timer != nil {
+		g.timer.Reset(g.timeout)
+	}
 }
 
 // Pause stops the countdown, for phases another timeout already covers.
@@ -48,7 +54,9 @@ func (g *Guard) Progress() {
 func (g *Guard) Pause() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.timer.Stop()
+	if g.timer != nil {
+		g.timer.Stop()
+	}
 }
 
 // Reader reports every read that moves bytes, and the end of input.

@@ -174,10 +174,13 @@ type Gossip struct {
 	holder *cluster.Holder
 	log    *slog.Logger
 
-	mu        sync.Mutex // guards mem and saved: memberlist calls us from several goroutines, and so do HTTP handlers
+	mu        sync.Mutex // guards mem, saved and knownBefore: memberlist calls us from several goroutines, and so do HTTP handlers
 	mem       *membership
 	statePath string
 	saved     []byte // what the MEMBERS file holds now, to skip rewriting it unchanged
+	// knownBefore is set when a member list received while joining already
+	// named this node: the cluster has seen a node by this name before.
+	knownBefore bool
 
 	// Saving happens on its own goroutine. memberlist calls NotifyJoin,
 	// NotifyUpdate and NotifyLeave while holding its own node lock, so
@@ -405,9 +408,19 @@ func (g *Gossip) flush() {
 	g.mu.Unlock()
 }
 
+// KnownBefore reports whether, as this node joined, the cluster already knew
+// a node by its name. A list a peer sends later names it as a matter of
+// course, so only the lists received while joining count.
+func (g *Gossip) KnownBefore() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.knownBefore
+}
+
 // mergeRemote learns the members a peer knows. A peer's list is input from
-// the network: an entry that fails validation is skipped, not trusted.
-func (g *Gossip) mergeRemote(buf []byte) {
+// the network: an entry that fails validation is skipped, not trusted. join
+// is set for the lists exchanged as a node joins.
+func (g *Gossip) mergeRemote(buf []byte, join bool) {
 	if len(buf) == 0 {
 		return
 	}
@@ -422,6 +435,9 @@ func (g *Gossip) mergeRemote(buf []byte) {
 	}
 	slices.Sort(ids)
 	g.mu.Lock()
+	if _, ok := members[g.mem.self]; ok && join {
+		g.knownBefore = true
+	}
 	var learned []string
 	for _, id := range ids {
 		changed, err := g.mem.learn(id, members[id])
@@ -507,7 +523,7 @@ func (d *delegate) LocalState(join bool) []byte {
 }
 
 // MergeRemoteState receives a peer's LocalState.
-func (d *delegate) MergeRemoteState(buf []byte, join bool) { d.g.mergeRemote(buf) }
+func (d *delegate) MergeRemoteState(buf []byte, join bool) { d.g.mergeRemote(buf, join) }
 
 // slogWriter turns memberlist's "[LEVEL] memberlist: ..." log lines into
 // structured log records at the matching level.
