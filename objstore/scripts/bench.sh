@@ -28,7 +28,13 @@ for i in $(seq 1 "$repeats"); do
 	rm -rf data
 	# shellcheck disable=SC2086 # the options are meant to split into words
 	scripts/cluster.sh start $cluster >/dev/null
+	# Through the balancer, wherever --port put it, unless the options say -addr.
+	addr=()
+	if [[ " $load " != *" -addr "* ]]; then
+		lb_port=$(sed -n 's/^PORT=//p' data/config)
+		addr=(-addr "127.0.0.1:${lb_port:-8080}")
+	fi
 	# shellcheck disable=SC2086
-	bin/objbench $load -label "$label" -json "$results" | sed -n 2p | sed "s/^/$label, run $i:/"
+	bin/objbench $load "${addr[@]}" -label "$label" -json "$results" | sed -n 2p | sed "s/^/$label, run $i:/"
 	scripts/cluster.sh stop >/dev/null
 done

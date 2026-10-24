@@ -51,8 +51,17 @@ scripts/cluster.sh stop
 ```
 
 `cluster.sh start` saves N, R and W in `data/config`, and `add` and `revive` reuse them, so every
-node agrees. Add `--sloppy` to turn on [sloppy quorums](#sloppy-quorums). Run `scripts/cluster.sh`
-alone for all its commands and options.
+node agrees. Add `--sloppy` to turn on [sloppy quorums](#sloppy-quorums). If another program
+holds a port the cluster needs, `start` says which and stops; pick others with `--port` (the
+balancer; node nI serves on the next ports) and `--gossip-port`, and point `objctl` there:
+
+```bash
+scripts/cluster.sh start --port 9080 --gossip-port 9940   # balancer :9080, nodes :9081-, gossip :9941-
+export OBJSTORE_ADDR=127.0.0.1:9080
+```
+
+Every later `cluster.sh` command finds the cluster on those ports. Run `scripts/cluster.sh` alone
+for all its commands and options.
 
 **Conflicts.** Two writes that start from the same version are concurrent, and both are kept:
 
